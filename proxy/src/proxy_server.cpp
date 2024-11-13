@@ -1,1708 +1,706 @@
 
 
-#include "proxy/proxy_server.hpp"
+#include "proxy/libproxy_pch.hpp"
 
-#include <boost/hana.hpp>
-#include "ctre.hpp"
+#include "proxy/proxy_session.hpp"
+#include "proxy/proxy_server.hpp"
+#include "proxy/strutil.hpp"
+#include "proxy/fileop.hpp"
+#include "proxy/logging.hpp"
+#include "proxy/use_awaitable.hpp"
+#include "proxy/proxy_stream.hpp"
+
+#include <boost/asio.hpp>
+
+#include <boost/regex.hpp>
+
+#include <fmt/xchar.h>
+#include <fmt/format.h>
 
 namespace proxy
 {
-	inline constexpr auto head_fmt =
-		R"(<html><head><meta charset="UTF-8"><title>Index of {}</title></head><body bgcolor="white"><h1>Index of {}</h1><hr><div><table><tbody>)";
-	inline constexpr auto tail_fmt =
-		"</tbody></table></div><hr></body></html>";
-	inline constexpr auto body_fmt =
-		// "<a href=\"{}\">{}</a>{} {}       {}\r\n";
-		"<tr><td class=\"link\"><a href=\"{}\">{}</a></td><td class=\"size\">{}</td><td class=\"date\">{}</td></tr>\r\n";
+	//////////////////////////////////////////////////////////////////////////
 
-
-		inline std::string file_hash(const fs::path& p, boost::system::error_code& ec)
-		{
-			ec = {};
-
-			boost::nowide::ifstream file(p.string(), std::ios::binary);
-			if (!file)
-			{
-				ec = boost::system::error_code(errno,
-					boost::system::generic_category());
-				return {};
-			}
-
-			boost::uuids::detail::sha1 sha1;
-			const auto buf_size = 1024 * 1024 * 4;
-			std::unique_ptr<char, decltype(&std::free)> bufs((char*)std::malloc(buf_size), &std::free);
-
-			while (file.read(bufs.get(), buf_size) || file.gcount())
-				sha1.process_bytes(bufs.get(), file.gcount());
-
-			boost::uuids::detail::sha1::digest_type hash;
-			sha1.get_digest(hash);
-
-			std::stringstream ss;
-			for (auto const& c : hash)
-				ss << std::hex << std::setfill('0') << std::setw(2) << static_cast<int>(c);
-
-			return ss.str();
-		}
-
-		template <typename CompletionToken>
-		inline auto async_hash_file(const fs::path& path, CompletionToken&& token)
-		{
-			return net::async_initiate<CompletionToken,
-				void (boost::system::error_code, std::string)>(
-					[path](auto&& handler) mutable
-					{
-						std::thread(
-							[path, handler = std::move(handler)]() mutable
-							{
-								boost::system::error_code ec;
-
-								auto hash = file_hash(path, ec);
-
-								auto executor = net::get_associated_executor(handler);
-								net::post(executor, [
-									ec = std::move(ec),
-									hash = std::move(hash),
-									handler = std::move(handler)]() mutable
-									{
-										handler(ec, hash);
-									});
-							}
-						).detach();
-					}, token);
-		}
-
-	net::awaitable<bool> proxy_session::connect_bridge_proxy(tcp::socket& remote_socket, std::string target_host,
-															 uint16_t target_port, boost::system::error_code& ec)
+	// 检测 host 是否是域名或主机名, 如果是域名则返回 true, 否则返回 false.
+	inline bool detect_hostname(const std::string& host) noexcept
 	{
-		auto executor = co_await net::this_coro::executor;
+		boost::system::error_code ec;
+		net::ip::address::from_string(host, ec);
+		if (ec)
+			return true;
+		return false;
+	}
 
-		tcp::resolver resolver{executor};
+	////////////////////////////////////////////////////////////////////////////////////
+	// proxy_server 实现
+	////////////////////////////////////////////////////////////////////////////////////
+	proxy_server::proxy_server(net::any_io_executor executor, proxy_server_option opt)
+		: m_executor(executor), m_option(std::move(opt))
+	{
+		init_ssl_context();
 
-		auto proxy_host = std::string(m_bridge_proxy->host());
-		std::string proxy_port;
-		if (m_bridge_proxy->port_number() == 0)
+		boost::nowide::nowide_filesystem();
+
+		boost::system::error_code ec;
+
+		if (fs::exists(m_option.ipip_db_, ec))
 		{
-			proxy_port = std::to_string(urls::default_port(m_bridge_proxy->scheme_id()));
-		}
-		else
-		{
-			proxy_port = std::to_string(m_bridge_proxy->port_number());
-		}
-		if (proxy_port.empty())
-		{
-			proxy_port = m_bridge_proxy->scheme();
-		}
-
-		XLOG_DBG << "connection id: " << m_connection_id << ", connect to next proxy: " << proxy_host << ":"
-				 << proxy_port;
-
-		tcp::resolver::results_type targets;
-
-		if (!detect_hostname(proxy_host))
-		{
-			net::ip::tcp::endpoint endp(net::ip::address::from_string(proxy_host),
-										m_bridge_proxy->port_number()
-											? m_bridge_proxy->port_number()
-											: urls::default_port(m_bridge_proxy->scheme_id()));
-
-			targets = tcp::resolver::results_type::create(endp, proxy_host, m_bridge_proxy->scheme());
-		}
-		else
-		{
-			targets = co_await resolver.async_resolve(proxy_host, proxy_port, net_awaitable[ec]);
-
-			if (ec)
+			m_ipip = std::make_unique<ipip_datx>();
+			if (!m_ipip->load(m_option.ipip_db_))
 			{
-				XLOG_FWARN("connection id: {},"
-						   " resolver to next proxy {}:{} error: {}",
-						   m_connection_id, std::string(m_bridge_proxy->host()), std::string(m_bridge_proxy->port()),
-						   ec.message());
-
-				co_return false;
+				m_ipip.reset();
 			}
 		}
 
-		if (m_option.happyeyeballs_)
+		init_acceptor();
+	}
+
+	pem_file proxy_server::determine_pem_type(const std::string& filepath) noexcept
+	{
+		pem_file result{filepath, pem_type::none};
+
+		boost::nowide::ifstream file(filepath);
+		if (!file.is_open())
 		{
-			co_await asio_util::async_connect(remote_socket, targets, [this](const auto& ec, auto& stream, auto& endp)
-			{ return check_condition(ec, stream, endp); }, net_awaitable[ec]);
+			return result;
 		}
-		else
+
+		if (fs::path(filepath).filename() == "password.txt" || fs::path(filepath).filename() == "passwd.txt" ||
+			fs::path(filepath).filename() == "passwd" || fs::path(filepath).filename() == "password" ||
+			fs::path(filepath).filename() == "passphrase" || fs::path(filepath).filename() == "passphrase.txt")
 		{
-			for (auto endpoint : targets)
+			result.type_ = pem_type::pwd;
+			return result;
+		}
+
+		if (fs::path(filepath).filename() == "domain.txt" || fs::path(filepath).filename() == "domain" ||
+			fs::path(filepath).filename() == "servername" || fs::path(filepath).filename() == "servername.txt")
+		{
+			result.type_ = pem_type::domain;
+			return result;
+		}
+
+		proxy::pem_type type = pem_type::none;
+		std::string line;
+
+		boost::regex re(R"(-----BEGIN\s.*\s?PRIVATE\sKEY-----)");
+		boost::smatch what;
+
+		while (std::getline(file, line))
+		{
+			if (line.find("-----BEGIN CERTIFICATE-----") != std::string::npos)
 			{
-				ec = boost::asio::error::host_not_found;
+				type = pem_type::cert;
+				result.chains_++;
+				continue;
+			}
+			else if (line.find("DH PARAMETERS-----") != std::string::npos)
+			{
+				type = pem_type::dhparam;
+				break;
+			}
+			else if (boost::regex_search(line, what, re))
+			{
+				type = pem_type::key;
+				break;
+			}
+		}
+		result.type_ = type;
 
-				if (m_option.connect_v4_only_)
+		return result;
+	}
+
+	void proxy_server::find_cert(const fs::path& directory) noexcept
+	{
+		if (!fs::exists(directory) || !fs::is_directory(directory))
+		{
+			XLOG_WARN << "Path is not a directory or doesn't exist: " << directory;
+			return;
+		}
+
+		certificate_file file;
+
+		// 域名在路径中，如：/etc/letsencrypt/live/www.jackarain.org/
+		boost::regex re(R"(([^\/|\\]+?\.[a-zA-Z]{2,})(?=\/?$))");
+		boost::smatch what;
+		if (boost::regex_search(directory.string(), what, re))
+		{
+			file.domain_ = std::string(what[1]);
+			strutil::trim(file.domain_);
+		}
+
+		for (const auto& entry : fs::directory_iterator(directory))
+		{
+			if (entry.is_directory())
+			{
+				find_cert(entry.path());
+				continue;
+			}
+
+			if (entry.is_regular_file())
+			{
+				// 读取文件, 并判断文件类型.
+				auto type = determine_pem_type(entry.path().string());
+				switch (type.type_)
 				{
-					if (endpoint.endpoint().address().is_v6())
+				case pem_type::cert:
+					if (type.chains_ > file.cert_.chains_)
 					{
-						continue;
+						file.cert_ = type;
 					}
-				}
-				else if (m_option.connect_v6_only_)
-				{
-					if (endpoint.endpoint().address().is_v4())
-					{
-						continue;
-					}
-				}
-
-				boost::system::error_code ignore_ec;
-				remote_socket.close(ignore_ec);
-
-				if (m_bind_interface)
-				{
-					tcp::endpoint bind_endpoint(*m_bind_interface, 0);
-
-					remote_socket.open(bind_endpoint.protocol(), ec);
-					if (ec)
-					{
-						break;
-					}
-
-					remote_socket.bind(bind_endpoint, ec);
-					if (ec)
-					{
-						break;
-					}
-				}
-
-				co_await remote_socket.async_connect(endpoint, net_awaitable[ec]);
-				if (!ec)
-				{
+					break;
+				case pem_type::key:
+					file.key_ = type;
+					break;
+				case pem_type::dhparam:
+					file.dhparam_ = type;
+					break;
+				case pem_type::pwd:
+					file.pwd_ = type;
+					break;
+				case pem_type::domain:
+					fileop::read(entry.path(), file.domain_);
+					strutil::trim(file.domain_);
+					break;
+				default:
 					break;
 				}
 			}
 		}
 
-		if (ec)
+		// 如果找到了证书文件, 创建一个证书文件对象.
+		if (file.cert_.type_ != pem_type::none && file.key_.type_ != pem_type::none)
 		{
-			XLOG_FWARN("connection id: {},"
-					   " connect to next proxy {}:{} error: {}",
-					   m_connection_id, std::string(m_bridge_proxy->host()), std::string(m_bridge_proxy->port()),
-					   ec.message());
+			// 创建 ssl context 对象.
+			file.ssl_context_.emplace(net::ssl::context::sslv23);
 
-			co_return false;
-		}
+			auto& ssl_ctx = file.ssl_context_.value();
 
-		XLOG_DBG << "connection id: " << m_connection_id << ", connect to next proxy: " << proxy_host << ":"
-				 << proxy_port << " success";
+			// 设置 ssl context 选项.
+			ssl_ctx.set_options(net::ssl::context::default_workarounds | net::ssl::context::no_sslv2 |
+								net::ssl::context::no_sslv3 | net::ssl::context::no_tlsv1 |
+								net::ssl::context::no_tlsv1_1 | net::ssl::context::single_dh_use);
 
-		// 如果启用了 noise, 则在向上游代理服务器发起 tcp 连接成功后, 发送 noise
-		// 数据以及接收 noise 数据.
-		if (m_option.scramble_)
-		{
-			if (!co_await noise_handshake(remote_socket, m_outin_key, m_outout_key))
+			// 如果设置了 ssl_prefer_server_ciphers_ 则设置 SSL_OP_CIPHER_SERVER_PREFERENCE.
+			if (m_option.ssl_prefer_server_ciphers_)
 			{
-				co_return false;
+				ssl_ctx.set_options(SSL_OP_CIPHER_SERVER_PREFERENCE);
 			}
 
-			XLOG_DBG << "connection id: " << m_connection_id << ", with upstream noise completed";
-		}
-
-		// 使用ssl加密与下一级代理通信.
-		if (m_option.proxy_pass_use_ssl_)
-		{
-			// 设置 ssl cert 证书目录.
-			if (fs::exists(m_option.ssl_cacert_path_))
+			// 默认的 ssl ciphers.
+			const std::string ssl_ciphers = "HIGH:!aNULL:!MD5:!3DES";
+			if (m_option.ssl_ciphers_.empty())
 			{
-				m_ssl_cli_context.add_verify_path(m_option.ssl_cacert_path_, ec);
-				if (ec)
-				{
-					XLOG_FWARN("connection id: {}, "
-							   "load cert path: {}, "
-							   "error: {}",
-							   m_connection_id, m_option.ssl_cacert_path_, ec.message());
-
-					co_return false;
-				}
-			}
-		}
-
-		auto scheme = m_bridge_proxy->scheme();
-
-		auto instantiate_stream = [this, &scheme, &proxy_host, &remote_socket,
-								   &ec]() mutable -> net::awaitable<variant_stream_type>
-		{
-			ec = {};
-
-			XLOG_DBG << "connection id: " << m_connection_id << ", connect to next proxy: " << proxy_host
-					 << " instantiate stream";
-
-			if (m_option.proxy_pass_use_ssl_ || scheme == "https")
-			{
-				m_ssl_cli_context.set_verify_mode(net::ssl::verify_peer);
-				auto cert = default_root_certificates();
-				m_ssl_cli_context.add_certificate_authority(net::buffer(cert.data(), cert.size()), ec);
-				if (ec)
-				{
-					XLOG_FWARN("connection id: {},"
-							   " add_certificate_authority error: {}",
-							   m_connection_id, ec.message());
-				}
-
-				m_ssl_cli_context.use_tmp_dh(net::buffer(default_dh_param()), ec);
-
-				m_ssl_cli_context.set_verify_callback(net::ssl::rfc2818_verification(proxy_host), ec);
-				if (ec)
-				{
-					XLOG_FWARN("connection id: {},"
-							   " set_verify_callback error: {}",
-							   m_connection_id, ec.message());
-				}
-
-				// 生成 ssl socket 对象.
-				auto sock_stream = init_proxy_stream(std::move(remote_socket), m_ssl_cli_context);
-
-				// get origin ssl stream type.
-				ssl_stream& ssl_socket = boost::variant2::get<ssl_stream>(sock_stream);
-
-				if (m_option.scramble_)
-				{
-					auto& next_layer = ssl_socket.next_layer();
-
-					using NextLayerType = std::decay_t<decltype(next_layer)>;
-
-					if constexpr (!std::same_as<tcp::socket, NextLayerType>)
-					{
-						next_layer.set_scramble_key(m_outout_key);
-
-						next_layer.set_unscramble_key(m_outin_key);
-					}
-				}
-
-				std::string sni = m_option.proxy_ssl_name_.empty() ? proxy_host : m_option.proxy_ssl_name_;
-
-				// Set SNI Hostname.
-				if (!SSL_set_tlsext_host_name(ssl_socket.native_handle(), sni.c_str()))
-				{
-					XLOG_FWARN("connection id: {},"
-							   " SSL_set_tlsext_host_name error: {}",
-							   m_connection_id, ::ERR_get_error());
-				}
-
-				XLOG_DBG << "connection id: " << m_connection_id << ", do async ssl handshake...";
-
-				// do async handshake.
-				co_await ssl_socket.async_handshake(net::ssl::stream_base::client, net_awaitable[ec]);
-				if (ec)
-				{
-					XLOG_FWARN("connection id: {},"
-							   " ssl client protocol handshake error: {}",
-							   m_connection_id, ec.message());
-				}
-
-				XLOG_FDBG("connection id: {}, ssl handshake: {}", m_connection_id, proxy_host);
-
-				co_return sock_stream;
+				m_option.ssl_ciphers_ = ssl_ciphers;
 			}
 
-			auto sock_stream = init_proxy_stream(std::move(remote_socket));
+			// 设置 ssl ciphers.
+			SSL_CTX_set_cipher_list(ssl_ctx.native_handle(), m_option.ssl_ciphers_.c_str());
 
-			auto& sock = boost::variant2::get<proxy_tcp_socket>(sock_stream);
-
-			if (m_option.scramble_)
-			{
-				using NextLayerType = std::decay_t<decltype(sock)>;
-
-				if constexpr (!std::same_as<tcp::socket, NextLayerType>)
-				{
-					sock.set_scramble_key(m_outout_key);
-
-					sock.set_unscramble_key(m_outin_key);
-				}
-			}
-
-			co_return sock_stream;
-		};
-
-		m_remote_socket = std::move(co_await instantiate_stream());
-
-		XLOG_DBG << "connection id: " << m_connection_id << ", connect to next proxy: " << proxy_host << ":"
-				 << proxy_port << " start upstream handshake with " << std::string(scheme);
-
-		if (scheme.starts_with("socks"))
-		{
-			socks_client_option opt;
-
-			opt.target_host = target_host;
-			opt.target_port = target_port;
-			opt.proxy_hostname = true;
-			opt.username = std::string(m_bridge_proxy->user());
-			opt.password = std::string(m_bridge_proxy->password());
-
-			if (scheme == "socks4")
-			{
-				opt.version = socks4_version;
-			}
-			else if (scheme == "socks4a")
-			{
-				opt.version = socks4a_version;
-			}
-
-			co_await async_socks_handshake(m_remote_socket, opt, net_awaitable[ec]);
-		}
-		else if (scheme.starts_with("http"))
-		{
-			http_proxy_client_option opt;
-
-			opt.target_host = target_host;
-			opt.target_port = target_port;
-			opt.username = std::string(m_bridge_proxy->user());
-			opt.password = std::string(m_bridge_proxy->password());
-
-			co_await async_http_proxy_handshake(m_remote_socket, opt, net_awaitable[ec]);
-		}
-
-		if (ec)
-		{
-			XLOG_FWARN("connection id: {}"
-					   ", {} connect to next host {}:{} error: {}",
-					   m_connection_id, std::string(scheme), target_host, target_port, ec.message());
-
-			co_return false;
-		}
-
-		co_return true;
-	}
-
-	net::awaitable<void> proxy_session::on_http_json(const http_context& hctx)
-	{
-		boost::system::error_code ec;
-		auto& request = hctx.request_;
-
-		auto target = make_real_target_path(hctx.command_[1]);
-
-		std::array<std::byte, 4096> pre_alloc_buf;
-		std::pmr::monotonic_buffer_resource mbr(pre_alloc_buf.data(), pre_alloc_buf.size());
-		std::pmr::polymorphic_allocator<char> alloc(&mbr);
-
-		fs::directory_iterator end;
-		fs::directory_iterator it(target, ec);
-		if (ec)
-		{
-			string_response res{
-				std::piecewise_construct,
-				std::make_tuple(alloc),
-				std::make_tuple(http::status::found, request.version(), alloc)
-			};
-			res.set(http::field::server, version_string);
-			res.set(http::field::date, server_date_string(alloc));
-			res.set(http::field::location, "/");
-			res.keep_alive(request.keep_alive());
-			res.prepare_payload();
-
-			string_response_serializer sr(res);
-			co_await http::async_write(m_local_socket, sr, net_awaitable[ec]);
+			// 设置证书文件.
+			boost::system::error_code ec;
+			ssl_ctx.use_certificate_chain_file(file.cert_.filepath_.string(), ec);
 			if (ec)
 			{
-				XLOG_WARN << "connection id: " << m_connection_id << ", http_dir write location err: " << ec.message();
+				XLOG_WARN << "use_certificate_chain_file: " << file.cert_.filepath_ << ", error: " << ec.message();
+				return;
 			}
 
-			co_return;
-		}
-
-		bool hash = false;
-
-		urls::params_view qp(hctx.command_[3]);
-		if (qp.find("hash") != qp.end())
-		{
-			hash = true;
-		}
-
-		boost::json::array path_list;
-
-		for (; it != end && !m_abort; it++)
-		{
-			const auto& item = it->path();
-			boost::json::object obj;
-
-			auto [ftime, unc_path] = file_last_wirte_time(item);
-			obj["last_write_time"] = ftime;
-
-			if (fs::is_directory(unc_path.empty() ? item : unc_path, ec))
+			// 设置 password 文件, 如果存在的话.
+			if (file.pwd_.type_ != pem_type::none && fs::exists(file.pwd_.filepath_))
 			{
-				obj["filename"] = item.filename().string();
-				obj["is_dir"] = true;
-			}
-			else
-			{
-				obj["filename"] = item.filename().string();
-				obj["is_dir"] = false;
-				if (unc_path.empty())
+				auto pwd = file.pwd_.filepath_;
+
+				ssl_ctx.set_password_callback([pwd]([[maybe_unused]] auto... args)
 				{
-					unc_path = item;
-				}
-				auto sz = fs::file_size(unc_path, ec);
-				if (ec)
-				{
-					sz = 0;
-				}
-				obj["filesize"] = sz;
-				if (hash)
-				{
-					auto ret = co_await async_hash_file(unc_path, net_awaitable[ec]);
-					if (ec)
-					{
-						ret = "";
-					}
-					obj["hash"] = ret;
-				}
+					std::string password;
+					fileop::read(pwd, password);
+					return password;
+				});
 			}
 
-			path_list.push_back(obj);
-		}
-
-		auto body = boost::json::serialize(path_list);
-
-		string_response res{
-			std::piecewise_construct,
-			std::make_tuple(alloc),
-			std::make_tuple(http::status::ok, request.version(), alloc)
-		};
-		res.set(http::field::server, version_string);
-		res.set(http::field::date, server_date_string(alloc));
-		res.set(http::field::content_type, "application/json");
-		res.keep_alive(request.keep_alive());
-		res.body() = body;
-		res.prepare_payload();
-
-		string_response_serializer sr(res);
-		co_await http::async_write(m_local_socket, sr, net_awaitable[ec]);
-		if (ec)
-		{
-			XLOG_WARN << "connection id: " << m_connection_id << ", http dir write body err: " << ec.message();
-		}
-
-		co_return;
-	}
-
-	net::awaitable<void> proxy_session::on_http_dir(const http_context& hctx)
-	{
-		using namespace std::literals;
-
-		boost::system::error_code ec;
-		auto& request = hctx.request_;
-
-		std::array<std::byte, 16384> pre_alloc_buf;
-		std::pmr::monotonic_buffer_resource mbr(pre_alloc_buf.data(), pre_alloc_buf.size());
-		std::pmr::polymorphic_allocator<char> alloc(&mbr);
-
-		// 查找目录下是否存在 index.html 或 index.htm 文件, 如果存在则返回该文件.
-		// 否则返回目录下的文件列表.
-		auto index_html = fs::path(hctx.target_path_) / "index.html";
-		fs::exists(index_html, ec) ? index_html = index_html : index_html = fs::path(hctx.target_path_) / "index.htm";
-
-		if (fs::exists(index_html, ec))
-		{
-			boost::nowide::ifstream file(index_html.string(), std::ios::binary);
-			if (file)
-			{
-				std::pmr::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>(),
-										 alloc);
-
-				string_response res{
-					std::piecewise_construct,
-					std::make_tuple(content, alloc),
-					std::make_tuple(http::status::ok, request.version(), alloc)
-				};
-				res.set(http::field::server, version_string);
-				res.set(http::field::date, server_date_string(alloc));
-				auto ext = strutil::to_lower(index_html.extension().string());
-				if (global_mimes.count(ext))
-				{
-					res.set(http::field::content_type, global_mimes.at(ext));
-				}
-				else
-				{
-					res.set(http::field::content_type, "text/plain");
-				}
-				res.keep_alive(request.keep_alive());
-				res.prepare_payload();
-
-				string_response_serializer sr(res);
-				co_await http::async_write(m_local_socket, sr, net_awaitable[ec]);
-				if (ec)
-				{
-					XLOG_WARN << "connection id: " << m_connection_id << ", http dir write index err: " << ec.message();
-				}
-
-				co_return;
-			}
-		}
-
-		auto path_list = format_path_list(hctx.target_path_, ec, alloc);
-
-		assert(path_list.get_allocator() == alloc);
-
-		if (ec)
-		{
-			string_response res{
-				std::piecewise_construct,
-				std::make_tuple(alloc),
-				std::make_tuple(http::status::found, request.version(), alloc)
-			};
-
-			res.set(http::field::server, version_string);
-			res.set(http::field::date, server_date_string(alloc));
-			res.set(http::field::location, "/");
-			res.keep_alive(request.keep_alive());
-			res.prepare_payload();
-
-			string_response_serializer sr(res);
-			co_await http::async_write(m_local_socket, sr, net_awaitable[ec]);
+			// 设置私钥文件.
+			ssl_ctx.use_private_key_file(file.key_.filepath_.string(), net::ssl::context::pem, ec);
 			if (ec)
 			{
-				XLOG_WARN << "connection id: " << m_connection_id << ", http_dir write location err: " << ec.message();
+				XLOG_WARN << "use_private_key_file: " << file.key_.filepath_ << ", error: " << ec.message();
+				return;
 			}
 
-			co_return;
+			// 设置 dhparam 文件, 如果存在的话.
+			if (file.dhparam_.type_ != pem_type::none && fs::exists(file.dhparam_.filepath_))
+			{
+				ssl_ctx.use_tmp_dh_file(file.dhparam_.filepath_.string(), ec);
+				if (ec)
+				{
+					XLOG_WARN << "use_tmp_dh_file: " << file.dhparam_.filepath_ << ", error: " << ec.message();
+					return;
+				}
+			}
+
+			// 保存到 m_certificates 中.
+			m_certificates.emplace_back(std::move(file));
 		}
-
-		auto target_path = make_target_path(hctx.target_);
-		std::pmr::string autoindex_page{alloc};
-		autoindex_page.reserve(4096);
-		fmt::format_to(std::back_inserter(autoindex_page), head_fmt, target_path, target_path);
-		fmt::format_to(std::back_inserter(autoindex_page), body_fmt, "../", "../", "", "");
-
-		for (const auto& s : path_list)
-		{
-			autoindex_page += s;
-		}
-
-		autoindex_page += tail_fmt;
-
-		string_response res{
-			std::piecewise_construct,
-			std::make_tuple(std::move(autoindex_page), alloc),
-			std::make_tuple(http::status::ok, request.version(), alloc)
-		};
-
-		res.set(http::field::server, version_string);
-		res.set(http::field::date, server_date_string(alloc));
-		res.keep_alive(request.keep_alive());
-		res.prepare_payload();
-
-		string_response_serializer sr(res);
-		co_await http::async_write(m_local_socket, sr, net_awaitable[ec]);
-		if (ec)
-		{
-			XLOG_WARN << "connection id: " << m_connection_id << ", http dir write body err: " << ec.message();
-		}
-
-		co_return;
 	}
 
-	net::awaitable<void> proxy_session::on_http_get(const http_context& hctx)
+	void proxy_server::init_acceptor() noexcept
 	{
-		boost::system::error_code ec;
+		auto& endps = m_option.listens_;
 
-		const auto& request = hctx.request_;
-		const fs::path& path = hctx.target_path_;
-
-		if (!fs::exists(path, ec))
+		for (const auto& [endp, v6only] : endps)
 		{
-			XLOG_WARN << "connection id: " << m_connection_id << ", http " << hctx.target_ << " file not exists";
+			tcp_acceptor acceptor(m_executor);
+			boost::system::error_code ec;
 
-			std::pmr::string fake_page{hctx.alloc};
-
-			fmt::vformat_to(std::back_inserter(fake_page), fake_404_content_fmt, fmt::make_format_args(server_date_string(hctx.alloc)));
-
-			co_await net::async_write(m_local_socket, net::buffer(fake_page), net::transfer_all(), net_awaitable[ec]);
-
-			co_return;
-		}
-
-		if (fs::is_directory(path, ec))
-		{
-			XLOG_DBG << "connection id: " << m_connection_id << ", http " << hctx.target_ << " is directory";
-
-			std::pmr::string url = {"http://", hctx.alloc};
-			if (is_crytpo_stream())
+			acceptor.open(endp.protocol(), ec);
+			if (ec)
 			{
-				url = "https://";
-			}
-			url += request[http::field::host];
-			urls::url u(url);
-			std::pmr::string target{hctx.target_ , hctx.alloc};
-			target += "/";
-			u.set_path(target);
-
-			co_await location_http_route(request, u.buffer());
-
-			co_return;
-		}
-
-		size_t content_length = fs::file_size(path, ec);
-		if (ec)
-		{
-			XLOG_WARN << "connection id: " << m_connection_id << ", http " << hctx.target_
-					  << " file size error: " << ec.message();
-
-			co_await default_http_route(request, fake_400_content, http::status::bad_request);
-
-			co_return;
-		}
-
-		boost::nowide::fstream file(path.string(), std::ios_base::binary | std::ios_base::in);
-
-		std::string user_agent;
-		if (request.count(http::field::user_agent))
-		{
-			user_agent = std::string(request[http::field::user_agent]);
-		}
-
-		std::string referer;
-		if (request.count(http::field::referer))
-		{
-			referer = std::string(request[http::field::referer]);
-		}
-
-		XLOG_DBG << "connection id: " << m_connection_id << ", http file: " << hctx.target_
-				 << ", size: " << content_length
-				 << (request.count("Range") ? ", range: " + std::string(request["Range"]) : std::string())
-				 << (!user_agent.empty() ? ", user_agent: " + user_agent : std::string())
-				 << (!referer.empty() ? ", referer: " + referer : std::string());
-
-		http::status st = http::status::ok;
-		auto range = parser_http_ranges(request["Range"]);
-
-		// 只支持一个 range 的请求, 不支持多个 range 的请求.
-		if (range.size() == 1)
-		{
-			st = http::status::partial_content;
-			auto& r = range.front();
-
-			// 起始位置为 -1, 表示从文件末尾开始读取, 例如 Range: -500
-			// 则表示读取文件末尾的 500 字节.
-			if (r.first == -1)
-			{
-				// 如果第二个参数也为 -1, 则表示请求有问题, 返回 416.
-				if (r.second < 0)
-				{
-					co_await default_http_route(request, fake_416_content, http::status::range_not_satisfiable);
-					co_return;
-				}
-				else if (r.second >= 0)
-				{
-					// 计算起始位置和结束位置, 例如 Range: -5
-					// 则表示读取文件末尾的 5 字节.
-					// content_length - r.second 表示起始位置.
-					// content_length - 1 表示结束位置.
-					// 例如文件长度为 10 字节, 则起始位置为 5,
-					// 结束位置为 9(数据总长度为[0-9]), 一共 5 字节.
-					r.first = content_length - r.second;
-					r.second = content_length - 1;
-				}
-			}
-			else if (r.second == -1)
-			{
-				// 起始位置为正数, 表示从文件头开始读取, 例如 Range: 500
-				// 则表示读取文件头的 500 字节.
-				if (r.first < 0)
-				{
-					co_await default_http_route(request, fake_416_content, http::status::range_not_satisfiable);
-					co_return;
-				}
-				else
-				{
-					r.second = content_length - 1;
-				}
-			}
-
-			file.seekg(r.first, std::ios_base::beg);
-		}
-
-		buffer_response res{
-			std::piecewise_construct,
-			std::make_tuple(),
-			std::make_tuple(st, request.version(), hctx.alloc)
-		};
-
-		res.set(http::field::server, version_string);
-		res.set(http::field::date, server_date_string(hctx.alloc));
-
-		auto ext = strutil::to_lower(fs::path(path).extension().string());
-
-		if (global_mimes.count(ext))
-		{
-			res.set(http::field::content_type, global_mimes.at(ext));
-		}
-		else
-		{
-			res.set(http::field::content_type, "text/plain");
-		}
-
-		if (st == http::status::ok)
-		{
-			res.set(http::field::accept_ranges, "bytes");
-		}
-
-		if (st == http::status::partial_content)
-		{
-			const auto& r = range.front();
-
-			if (r.second < r.first && r.second >= 0)
-			{
-				co_await default_http_route(request, fake_416_content, http::status::range_not_satisfiable);
-				co_return;
-			}
-
-			std::pmr::string content_range{hctx.alloc};
-			fmt::format_to(std::back_inserter(content_range), "bytes {}-{}/{}", r.first, r.second, content_length);
-
-			content_length = r.second - r.first + 1;
-			res.set(http::field::content_range, content_range);
-		}
-
-		res.keep_alive(hctx.request_.keep_alive());
-		res.content_length(content_length);
-
-		response_serializer sr(res);
-
-		res.body().data = nullptr;
-		res.body().more = false;
-
-		co_await http::async_write_header(m_local_socket, sr, net_awaitable[ec]);
-		if (ec)
-		{
-			XLOG_WARN << "connection id: " << m_connection_id << ", http async_write_header: " << ec.message();
-
-			co_return;
-		}
-
-		auto buf_size = 5 * 1024 * 1024;
-		if (m_option.tcp_rate_limit_ > 0 && m_option.tcp_rate_limit_ < buf_size)
-		{
-			buf_size = m_option.tcp_rate_limit_;
-		}
-
-		std::unique_ptr<char, decltype(&std::free)> bufs((char*)std::malloc(buf_size), &std::free);
-		char* buf = bufs.get();
-		std::streamsize total = 0;
-
-		stream_rate_limit(m_local_socket, m_option.tcp_rate_limit_);
-
-		do
-		{
-			auto bytes_transferred = fileop::read(file, std::span<char>(buf, buf_size));
-			bytes_transferred = std::min<std::streamsize>(bytes_transferred, content_length - total);
-			if (bytes_transferred == 0 || total >= (std::streamsize)content_length)
-			{
-				res.body().data = nullptr;
-				res.body().more = false;
-			}
-			else
-			{
-				res.body().data = buf;
-				res.body().size = bytes_transferred;
-				res.body().more = true;
-			}
-
-			stream_expires_after(m_local_socket, std::chrono::seconds(m_option.tcp_timeout_));
-
-			co_await http::async_write(m_local_socket, sr, net_awaitable[ec]);
-			total += bytes_transferred;
-			if (ec == http::error::need_buffer)
-			{
-				ec = {};
+				XLOG_WARN << "acceptor open: " << endp << ", error: " << ec.message();
 				continue;
 			}
+
+			acceptor.set_option(net::socket_base::reuse_address(true), ec);
 			if (ec)
 			{
-				XLOG_WARN << "connection id: " << m_connection_id << ", http async_write: " << ec.message()
-						  << ", already write: " << total;
-				co_return;
+				XLOG_WARN << "acceptor set_option with reuse_address: " << ec.message();
 			}
-		}
-		while (!sr.is_done());
 
-		XLOG_DBG << "connection id: " << m_connection_id << ", http request: " << hctx.target_ << ", completed";
-
-		co_return;
-	}
-
-	template <CTRE_REGEX_INPUT_TYPE exp, auto func>
-	struct route_op
-	{
-		boost::asio::awaitable<bool> operator()(auto* _proxy_session, auto target, auto& http_ctx, auto alloc) const
-		{
-			if (auto result = ctre::match<exp>( target ) )
+			if (m_option.reuse_port_)
 			{
-				boost::hana::for_each(std::make_index_sequence<result.count()>(), [&](auto element)
-				{
-					// 将 正则匹配到的 () 子串，给依次 push 到 http_ctx.command_ 这个容器里.
-					http_ctx.command_.push_back(result.template get<element>());
-				});
-				co_await (_proxy_session->*func)(http_ctx);
-				co_return true;
-			}
-			co_return false;
-		}
-	};
+#ifdef ENABLE_REUSEPORT
+				using net::detail::socket_option::boolean;
+				using reuse_port = boolean<SOL_SOCKET, SO_REUSEPORT>;
 
-	template <auto... RouteOPs>
-	boost::asio::awaitable<void> routes(proxy_session* _proxy_session, auto& target, auto& http_ctx, auto alloc)
-	{
-		// 依次等待 route_op 执行，因为是 || 所以如果一个成功了，剩下的就不等了.
-		( (co_await RouteOPs(_proxy_session, target, http_ctx, alloc)) || ...);
-	}
-
-	net::awaitable<void> proxy_session::normal_web_server(string_request& req, pmr_alloc_t alloc)
-	{
-		boost::system::error_code ec;
-
-		bool keep_alive = false;
-		bool has_read_header = true;
-
-		for (; !m_abort;)
-		{
-			std::optional<request_parser> parser;
-			if (!has_read_header)
-			{
-				// normal_web_server 调用是从 http_proxy_get
-				// 跳转过来的, 该函数已经读取了请求头, 所以第1次不需
-				// 要再次读取请求头, 即 has_read_header 为 true.
-				// 当 keepalive 时，需要读取请求头, 此时 has_read_header
-				// 为 false, 则在此读取和解析后续的 http 请求头.
-				parser.emplace(std::piecewise_construct, std::make_tuple(alloc), std::make_tuple(alloc));
-				parser->body_limit(1024 * 512); // 512k
-				m_local_buffer.consume(m_local_buffer.size());
-
-				co_await http::async_read_header(m_local_socket, m_local_buffer, *parser, net_awaitable[ec]);
+				acceptor.set_option(reuse_port(true), ec);
 				if (ec)
 				{
-					XLOG_DBG << "connection id: " << m_connection_id << (keep_alive ? ", keepalive" : "")
-							 << ", web async_read_header: " << ec.message();
-					co_return;
+					XLOG_WARN << "acceptor set_option with SO_REUSEPORT: " << ec.message();
 				}
-
-				req = parser->release();
+#endif
 			}
 
-			if (req[http::field::expect] == "100-continue")
+			if (v6only)
 			{
-				http::response<http::empty_body> res;
-				res.version(11);
-				res.result(http::status::method_not_allowed);
-
-				co_await http::async_write(m_local_socket, res, net_awaitable[ec]);
+				acceptor.set_option(net::ip::v6_only(true), ec);
 				if (ec)
 				{
-					XLOG_DBG << "connection id: " << m_connection_id << ", web expect async_write: " << ec.message();
+					XLOG_ERR << "TCP server accept "
+							 << "set v6_only failed: " << ec.message();
+					continue;
 				}
-				co_return;
 			}
 
-			has_read_header = false;
-			keep_alive = req.keep_alive();
-
-			if (beast::websocket::is_upgrade(req))
+			acceptor.bind(endp, ec);
+			if (ec)
 			{
-				std::pmr::string fake_page{alloc};
-
-				fmt::vformat_to(std::back_inserter(fake_page), fake_404_content_fmt, fmt::make_format_args(server_date_string(alloc)));
-
-				co_await net::async_write(m_local_socket, net::buffer(fake_page), net::transfer_all(),
-										  net_awaitable[ec]);
-
-				co_return;
+				XLOG_ERR << "acceptor bind: " << endp << ", error: " << ec.message();
+				continue;
 			}
 
-			std::pmr::string target{req.target(), alloc};
-			std::string_view target_pv{target};
-			boost::match_results<
-				std::pmr::string::const_iterator,
-				std::pmr::polymorphic_allocator<boost::sub_match<std::pmr::string::const_iterator>>
-			> what{alloc};
-
-			http_context http_ctx{
-				alloc,
-				std::pmr::vector<std::string_view>{alloc},
-				req,
-				req.target(),
-				make_real_target_path(req.target())
-            };
-
-			co_await routes<
-				route_op<R"regex((.*)/)regex", &proxy_session::on_http_dir>{},
-				route_op<R"regex((.*)\?q=json(&(.*))?)regex", &proxy_session::on_http_json>{},
-				route_op<R"regex(^(?!.*\/$).*$)regex", &proxy_session::on_http_get>{}
-			>(this, target_pv, http_ctx, alloc);
-
-			if (!keep_alive)
+			acceptor.listen(net::socket_base::max_listen_connections, ec);
+			if (ec)
 			{
-				break;
+				XLOG_ERR << "acceptor listen: " << endp << ", error: " << ec.message();
+				continue;
 			}
-			continue;
+
+			m_tcp_acceptors.emplace_back(std::move(acceptor));
 		}
-
-		co_await m_local_socket.lowest_layer().async_wait(net::socket_base::wait_read, net_awaitable[ec]);
-
-		co_return;
 	}
 
-	int proxy_session::http_authorization(std::string_view pa)
+	void proxy_server::init_ssl_context() noexcept
 	{
-		if (m_option.auth_users_.empty())
+		if (m_option.ssl_cert_path_.empty())
 		{
-			return PROXY_AUTH_SUCCESS;
+			return;
 		}
 
-		if (pa.empty())
+		find_cert(m_option.ssl_cert_path_);
+
+		for (const auto& ctx : m_certificates)
 		{
-			return PROXY_AUTH_NONE;
+			XLOG_DBG << "domain: '" << ctx.domain_ << "', cert: '" << ctx.cert_.filepath_.string() << "', key: '"
+					 << ctx.key_.filepath_.string() << "', dhparam: '" << ctx.dhparam_.filepath_.string() << "', pwd: '"
+					 << ctx.pwd_.filepath_.string() << "'";
 		}
 
-		auto pos = pa.find(' ');
-		if (pos == std::string::npos)
+		auto sni_callback_c =  [](SSL *ssl, int *ad, void *arg) -> int
 		{
-			return PROXY_AUTH_ILLEGAL;
-		}
+			proxy_server* self = (proxy_server*)arg;
+			return self->sni_callback(ssl, ad);
+		};
 
-		auto type = pa.substr(0, pos);
-		auto auth = pa.substr(pos + 1);
-
-		if (type != "Basic")
-		{
-			return PROXY_AUTH_ILLEGAL;
-		}
-
-		char buff[1024];
-		std::pmr::monotonic_buffer_resource mbr(buff, sizeof buff);
-		pmr_alloc_t alloc(&mbr);
-
-		std::pmr::string userinfo(beast::detail::base64::decoded_size(auth.size()), 0, alloc);
-		auto [len, _] = beast::detail::base64::decode((char*)userinfo.data(), auth.data(), auth.size());
-		userinfo.resize(len);
-
-		pos = userinfo.find(':');
-
-		std::pmr::string uname{userinfo.substr(0, pos), alloc};
-		std::pmr::string passwd{userinfo.substr(pos + 1), alloc};
-
-		bool verify_passed = m_option.auth_users_.empty();
-
-		for (auto [user, pwd] : m_option.auth_users_)
-		{
-			if (uname == user && passwd == pwd)
-			{
-				verify_passed = true;
-				user_rate_limit_config(user);
-				break;
-			}
-		}
-
-		auto endp = m_local_socket.remote_endpoint();
-		auto client = endp.address().to_string();
-		client += ":" + std::to_string(endp.port());
-
-		if (!verify_passed)
-		{
-			return PROXY_AUTH_FAILED;
-		}
-
-		return PROXY_AUTH_SUCCESS;
+		SSL_CTX_set_tlsext_servername_callback(
+			m_ssl_srv_context.native_handle(),
+			(int (*)(SSL *, int *, void *))sni_callback_c
+		);
+		SSL_CTX_set_tlsext_servername_arg(m_ssl_srv_context.native_handle(), this);
 	}
 
-	net::awaitable<bool> proxy_session::http_proxy_get()
+	int proxy_server::sni_callback(SSL* ssl, int* ad) noexcept
 	{
-		boost::system::error_code ec;
-		bool keep_alive = false;
-		bool first = true;
+		const char* servername = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+		if (servername)
+		{
+			certificate_file* default_ctx = nullptr;
+
+			for (auto& ctx : m_certificates)
+			{
+				if (ctx.domain_ == servername && ctx.ssl_context_.has_value())
+				{
+					SSL_set_SSL_CTX(ssl, ctx.ssl_context_->native_handle());
+					return SSL_TLSEXT_ERR_OK;
+				}
+				if (ctx.domain_.empty())
+				{
+					default_ctx = &ctx;
+				}
+			}
+
+			if (default_ctx)
+			{
+				SSL_set_SSL_CTX(ssl, default_ctx->ssl_context_->native_handle());
+				return SSL_TLSEXT_ERR_OK;
+			}
+		}
+		return SSL_TLSEXT_ERR_OK;
+	}
+
+
+	void proxy_server::start() noexcept
+	{
+		// 如果作为透明代理.
+		if (m_option.transparent_)
+		{
+#if defined(__linux__)
+
+#if !defined(IP_TRANSPARENT)
+#define IP_TRANSPARENT 19
+#endif
+#if !defined(IPV6_TRANSPARENT)
+#define IPV6_TRANSPARENT 75
+#endif
+
+#if defined(IP_TRANSPARENT) && defined(IPV6_TRANSPARENT)
+			// 设置 acceptor 为透明代理模式.
+			using transparent = net::detail::socket_option::boolean<IPPROTO_IP, IP_TRANSPARENT>;
+			using transparent6 = net::detail::socket_option::boolean<IPPROTO_IPV6, IPV6_TRANSPARENT>;
+
+			for (auto& acceptor : m_tcp_acceptors)
+			{
+				boost::system::error_code error;
+
+				acceptor.set_option(transparent(true), error);
+				acceptor.set_option(transparent6(true), error);
+			}
+#endif
+
+#else
+			XLOG_WARN << "transparent proxy only support linux";
+#endif
+			// 获取所有本机 ip 地址.
+			net::co_spawn(m_executor, get_local_address(), net::detached);
+		}
+
+		// 同时启动32个连接协程为每个 acceptor 用于为 proxy client 提供服务.
+		for (auto& acceptor : m_tcp_acceptors)
+		{
+			for (int i = 0; i < 32; i++)
+			{
+				net::co_spawn(m_executor, start_proxy_listen(acceptor), net::detached);
+			}
+		}
+	}
+
+	void proxy_server::close() noexcept
+	{
+		boost::system::error_code ignore_ec;
+		m_abort = true;
+
+		for (auto& acceptor : m_tcp_acceptors)
+		{
+			acceptor.close(ignore_ec);
+		}
+
+		for (auto& [id, c] : m_clients)
+		{
+			if (auto client = c.lock())
+			{
+				client->close();
+			}
+		}
+	}
+
+	net::awaitable<void> proxy_server::start_proxy_listen(tcp_acceptor& acceptor) noexcept
+	{
+		boost::system::error_code error;
+		net::socket_base::keep_alive keep_alive_opt(true);
+		net::ip::tcp::no_delay no_delay_opt(true);
+		net::ip::tcp::no_delay delay_opt(false);
+
+		auto self = shared_from_this();
 
 		while (!m_abort)
 		{
-			std::array<std::byte, 4096> pre_alloc_buf;
-			std::pmr::monotonic_buffer_resource mbr(pre_alloc_buf.data(), pre_alloc_buf.size());
-			pmr_alloc_t alloc(&mbr);
-			std::optional<request_parser> parser;
-			parser.emplace(std::piecewise_construct, std::make_tuple(alloc), std::make_tuple(alloc));
+			proxy_tcp_socket socket(m_executor);
 
-			parser->body_limit(1024 * 1024 * 10);
-			if (!first)
+			co_await acceptor.async_accept(socket.lowest_layer(), net_awaitable[error]);
+			if (error)
 			{
-				m_local_buffer.consume(m_local_buffer.size());
-			}
-
-			// 读取 http 请求头.
-			co_await http::async_read(m_local_socket, m_local_buffer, *parser, net_awaitable[ec]);
-			if (ec)
-			{
-				XLOG_WARN << "connection id: " << m_connection_id << (keep_alive ? ", keepalive" : "")
-						  << ", http_proxy_get request async_read: " << ec.message();
-
-				co_return !first;
-			}
-
-			auto req = parser->release();
-			auto mth = std::pmr::string(req.method_string(), alloc);
-			auto target_view = std::pmr::string(req.target(), alloc);
-			auto pa = std::pmr::string(req[http::field::proxy_authorization], alloc);
-
-			keep_alive = req.keep_alive();
-
-			XLOG_DBG << "connection id: " << m_connection_id << ", method: " << mth << ", target: " << target_view
-					 << (pa.empty() ? std::pmr::string(alloc) : ", proxy_authorization: " + pa);
-
-			// 判定是否为 GET url 代理模式.
-			bool get_url_proxy = false;
-			if (boost::istarts_with(target_view, "https://") || boost::istarts_with(target_view, "http://"))
-			{
-				get_url_proxy = true;
-			}
-
-			// http 代理认证, 如果请求的 rarget 不是 http url 或认证
-			// 失败, 则按正常 web 请求处理.
-			auto auth = http_authorization(pa);
-			if (auth != PROXY_AUTH_SUCCESS || !get_url_proxy)
-			{
-				auto expect_url = urls::parse_absolute_uri(target_view);
-
-				if (!expect_url.has_error())
+				if (!m_abort)
 				{
-					XLOG_WARN << "connection id: " << m_connection_id << ", proxy err: " << pauth_error_message(auth);
-
-					co_return !first;
+					XLOG_ERR << "start_proxy_listen"
+								", async_accept: "
+							 << error.message();
 				}
+				co_return;
+			}
 
-				// 如果 doc 目录为空, 则不允许访问目录
-				// 这里直接返回错误页面.
-				if (m_option.doc_directory_.empty())
-				{
-					co_return !first;
-				}
+			static std::atomic_size_t id{1};
+			size_t connection_id = id++;
 
-				// htpasswd 表示需要用户认证.
-				if (m_option.htpasswd_)
+			auto endp = socket.remote_endpoint(error);
+			auto client = endp.address().to_string();
+			client += ":" + std::to_string(endp.port());
+
+			std::vector<std::string> local_info;
+
+			if (m_ipip)
+			{
+				auto [ret, isp] = m_ipip->lookup(endp.address());
+				if (!ret.empty())
 				{
-					// 处理 http 认证, 如果客户没有传递认证信息, 则返回 401.
-					// 如果用户认证信息没有设置, 则直接返回 401.
-					auto auth = req[http::field::authorization];
-					if (auth.empty() || m_option.auth_users_.empty())
+					for (auto& c : ret)
 					{
-						XLOG_WARN << "connection id: " << m_connection_id
-								  << ", auth error: " << (auth.empty() ? "no auth" : "no user");
-
-						co_await unauthorized_http_route(req);
-						co_return true;
+						client += " " + c;
 					}
 
-					auto auth_result = http_authorization(auth);
-					if (auth_result != PROXY_AUTH_SUCCESS)
-					{
-						XLOG_WARN << "connection id: " << m_connection_id
-								  << ", auth error: " << pauth_error_message(auth_result);
-
-						co_await unauthorized_http_route(req);
-						co_return true;
-					}
+					local_info = ret;
 				}
 
-				// 如果不允许目录索引, 检查请求的是否为文件, 如果是具体文件则按文
-				// 件请求处理, 否则返回 403.
-				if (!m_option.autoindex_)
+				if (!isp.empty())
 				{
-					auto path = make_real_target_path(req.target());
-
-					if (!fs::is_directory(path, ec))
-					{
-						co_await normal_web_server(req, alloc);
-						co_return true;
-					}
-
-					// 如果不允许目录索引, 则直接返回 403 forbidden.
-					co_await forbidden_http_route(req);
-
-					co_return true;
-				}
-
-				// 按正常 http 目录请求来处理.
-				co_await normal_web_server(req, alloc);
-				co_return true;
-			}
-
-			const auto authority_pos = target_view.find_first_of("//") + 2;
-
-			std::string host;
-
-			const auto scheme_id = urls::string_to_scheme(target_view.substr(0, authority_pos - 3));
-			uint16_t port = urls::default_port(scheme_id);
-
-			auto host_pos = authority_pos;
-			auto host_end = std::string::npos;
-
-			auto port_start = std::string::npos;
-
-			for (auto pos = authority_pos; pos < target_view.size(); pos++)
-			{
-				const auto& c = target_view[pos];
-				if (c == '@')
-				{
-					host_pos = pos + 1;
-
-					host_end = std::string::npos;
-					port_start = std::string::npos;
-				}
-				else if (c == ':')
-				{
-					host_end = pos;
-					port_start = pos + 1;
-				}
-				else if (c == '/' || (pos + 1 == target_view.size()))
-				{
-					if (host_end == std::string::npos)
-					{
-						host_end = pos;
-					}
-					host = target_view.substr(host_pos, host_end - host_pos);
-
-					if (port_start != std::string::npos)
-					{
-						port = (uint16_t)std::atoi(target_view.substr(port_start, pos - port_start).c_str());
-					}
-
-					break;
+					client += " " + isp;
 				}
 			}
 
-			if (!m_remote_socket.is_open())
-			{
-				// 连接到目标主机.
-				co_await start_connect_host(host, port ? port : 80, ec, true);
-				if (ec)
-				{
-					XLOG_FWARN("connection id: {},"
-							   " connect to target {}:{} error: {}",
-							   m_connection_id, host, port, ec.message());
+			XLOG_DBG << "connection id: " << connection_id << ", start client incoming: " << client;
 
-					co_return !first;
-				}
+			if (!region_filter(local_info))
+			{
+				XLOG_WARN << "connection id: " << connection_id << ", region filter: " << client;
+
+				continue;
 			}
 
-			// 处理代理请求头.
-			const auto path_pos = target_view.find_first_of("/", authority_pos);
-			if (path_pos == std::string_view::npos)
+			socket.set_option(keep_alive_opt, error);
+
+			// 是否启用透明代理.
+#if defined(__linux__)
+			if (m_option.transparent_)
 			{
-				req.target("/");
+				if (co_await start_transparent_proxy(socket, connection_id))
+				{
+					continue;
+				}
+			}
+#endif
+
+			// 在启用 scramble 时, 刻意开启 Nagle's algorithm 以尽量保证数据包
+			// 被重组, 尽最大可能避免观察者通过观察 ip 数据包大小的规律来分析 tcp
+			// 数据发送调用, 从而增加噪声加扰的强度.
+			if (m_option.scramble_)
+			{
+				socket.set_option(delay_opt, error);
 			}
 			else
 			{
-				req.target(std::string(target_view.substr(path_pos)));
+				socket.set_option(no_delay_opt, error);
 			}
 
-			req.set(http::field::host, host);
+			// 创建 proxy_session 对象.
+			auto new_session =
+				std::make_shared<proxy_session>(m_executor, init_proxy_stream(std::move(socket)), connection_id, self);
 
-			if (req.find(http::field::connection) == req.end() && req.find(http::field::proxy_connection) != req.end())
-			{
-				req.set(http::field::connection, req[http::field::proxy_connection]);
-			}
+			// 保存 proxy_session 对象到 m_clients 中.
+			m_clients[connection_id] = new_session;
 
-			req.erase(http::field::proxy_authorization);
-			req.erase(http::field::proxy_connection);
-
-			co_await http::async_write(m_remote_socket, req, net_awaitable[ec]);
-			if (ec)
-			{
-				XLOG_WARN << "connection id: " << m_connection_id
-						  << ", http_proxy_get request async_write: " << ec.message();
-				co_return !first;
-			}
-
-			m_local_buffer.consume(m_local_buffer.size());
-			beast::flat_buffer buf;
-
-			response_parser _parser{std::piecewise_construct, std::make_tuple(alloc), std::make_tuple(alloc)};
-			_parser.body_limit(1024 * 1024 * 10);
-
-			auto bytes = co_await http::async_read(m_remote_socket, buf, _parser, net_awaitable[ec]);
-			if (ec)
-			{
-				XLOG_WARN << "connection id: " << m_connection_id
-						  << ", http_proxy_get response async_read: " << ec.message();
-				co_return !first;
-			}
-
-			co_await http::async_write(m_local_socket, _parser.release(), net_awaitable[ec]);
-			if (ec)
-			{
-				XLOG_WARN << "connection id: " << m_connection_id
-						  << ", http_proxy_get response async_write: " << ec.message();
-				co_return !first;
-			}
-
-			XLOG_DBG << "connection id: " << m_connection_id << ", transfer completed"
-					 << ", remote to local: " << bytes;
-
-			first = false;
-			if (!keep_alive)
-			{
-				break;
-			}
+			// 启动 proxy_session 对象.
+			new_session->start();
 		}
 
-		co_return true;
+		XLOG_WARN << "start_proxy_listen exit ...";
+		co_return;
 	}
-	net::awaitable<bool> proxy_session::http_proxy_connect()
+
+	net::awaitable<bool> proxy_server::start_transparent_proxy(util::proxy_tcp_socket& socket, size_t connection_id) noexcept
 	{
-		http::request<http::string_body> req;
-		boost::system::error_code ec;
+#ifndef SO_ORIGINAL_DST
+#	define SO_ORIGINAL_DST 80
+#endif
+		auto sockfd = socket.native_handle();
 
-		// 读取 http 请求头.
-		co_await http::async_read(m_local_socket, m_local_buffer, req, net_awaitable[ec]);
-		if (ec)
+		sockaddr_storage addr;
+		socklen_t addrlen = sizeof(addr);
+
+		int protocol = addr.ss_family == AF_INET6 ? IPPROTO_IPV6 : IPPROTO_IP;
+
+		if (::getsockopt(sockfd, protocol, SO_ORIGINAL_DST, (char*)&addr, &addrlen) < 0)
 		{
-			XLOG_ERR << "connection id: " << m_connection_id << ", http_proxy_connect async_read: " << ec.message();
-
+			XLOG_FWARN("connection id: {}, getsockopt: {}, SO_ORIGINAL_DST: {}", connection_id, (int)sockfd,
+					   strerror(errno));
 			co_return false;
 		}
 
-		auto mth = std::string(req.method_string());
-		auto target_view = std::string(req.target());
-		auto pa = std::string(req[http::field::proxy_authorization]);
+		net::ip::tcp::endpoint remote_endp;
 
-		XLOG_DBG << "connection id: " << m_connection_id << ", method: " << mth << ", target: " << target_view
-				 << (pa.empty() ? std::string() : ", proxy_authorization: " + pa);
-
-		// http 代理认证.
-		auto auth = http_authorization(pa);
-		if (auth != PROXY_AUTH_SUCCESS)
+		if (addr.ss_family == AF_INET6)
 		{
-			XLOG_WARN << "connection id: " << m_connection_id << ", proxy err: " << pauth_error_message(auth);
+			auto addr6 = reinterpret_cast<sockaddr_in6*>(&addr);
+			auto port = ntohs(addr6->sin6_port);
 
-			auto fake_page = fmt::vformat(fake_407_content_fmt, fmt::make_format_args(server_date_string()));
+			net::ip::address_v6::bytes_type bt;
 
-			co_await net::async_write(m_local_socket, net::buffer(fake_page), net::transfer_all(), net_awaitable[ec]);
+			std::copy(std::begin(addr6->sin6_addr.s6_addr), std::end(addr6->sin6_addr.s6_addr), std::begin(bt));
+
+			remote_endp.address(net::ip::make_address_v6(bt));
+			remote_endp.port(port);
+		}
+		else
+		{
+			auto addr4 = reinterpret_cast<sockaddr_in*>(&addr);
+			auto port = ntohs(addr4->sin_port);
+
+			remote_endp.address(net::ip::address_v4(htonl(addr4->sin_addr.s_addr)));
+			remote_endp.port(port);
+		}
+
+		// 创建透明代理, 开始连接通过代理服务器连接与当前客户端通信.
+		auto it = std::find_if(m_local_addrs.begin(), m_local_addrs.end(), [&](const auto& addr)
+		{
+			if (addr == remote_endp.address())
+			{
+				return true;
+			}
+			return false;
+		});
+
+		if (it == m_local_addrs.end())
+		{
+			XLOG_DBG << "connection id: " << connection_id << ", is tproxy, remote: " << remote_endp;
+
+			auto self = shared_from_this();
+
+			// 创建 proxy_session 对象用于 tproxy.
+			auto new_session = std::make_shared<proxy_session>(m_executor, init_proxy_stream(std::move(socket)),
+															   connection_id, self, true);
+
+			// 保存 proxy_session 对象到 m_clients 中.
+			m_clients[connection_id] = new_session;
+
+			// 设置 tproxy 的 remote 到 session 对象.
+			new_session->set_tproxy_remote(remote_endp);
+			// 启动 proxy_session 对象.
+			new_session->start();
 
 			co_return true;
 		}
 
-		auto pos = target_view.find(':');
-		if (pos == std::string::npos)
-		{
-			XLOG_ERR << "connection id: " << m_connection_id << ", illegal target: " << target_view;
-			co_return false;
-		}
-
-		std::string host(target_view.substr(0, pos));
-		std::string port(target_view.substr(pos + 1));
-
-		co_await start_connect_host(host, static_cast<uint16_t>(std::atol(port.c_str())), ec, true);
-		if (ec)
-		{
-			XLOG_FWARN("connection id: {},"
-					   " connect to target {}:{} error: {}",
-					   m_connection_id, host, port, ec.message());
-			co_return false;
-		}
-
-		http::response<http::empty_body> res{http::status::ok, req.version()};
-		res.reason("Connection established");
-
-		co_await http::async_write(m_local_socket, res, net_awaitable[ec]);
-		if (ec)
-		{
-			XLOG_FWARN("connection id: {},"
-					   " async write response {}:{} error: {}",
-					   m_connection_id, host, port, ec.message());
-			co_return false;
-		}
-
-		size_t l2r_transferred = 0;
-		size_t r2l_transferred = 0;
-
-		co_await (transfer(m_local_socket, m_remote_socket, l2r_transferred) &&
-				  transfer(m_remote_socket, m_local_socket, r2l_transferred));
-
-		XLOG_DBG << "connection id: " << m_connection_id << ", transfer completed"
-				 << ", local to remote: " << l2r_transferred << ", remote to local: " << r2l_transferred;
-
-		co_return true;
+		// 执行到这里, 表示客户端直接请求本代理服务, 则按普通代理服务请求处理.
+		co_return false;
 	}
 
-	net::awaitable<bool> proxy_session::socks_auth()
+	net::awaitable<void> proxy_server::get_local_address() noexcept
 	{
-		//  +----+------+----------+------+----------+
-		//  |VER | ULEN |  UNAME   | PLEN |  PASSWD  |
-		//  +----+------+----------+------+----------+
-		//  | 1  |  1   | 1 to 255 |  1   | 1 to 255 |
-		//  +----+------+----------+------+----------+
-		//  [           ]
-
 		boost::system::error_code ec;
-		m_local_buffer.consume(m_local_buffer.size());
-		auto bytes =
-			co_await net::async_read(m_local_socket, m_local_buffer, net::transfer_exactly(2), net_awaitable[ec]);
+
+		auto hostname = net::ip::host_name(ec);
 		if (ec)
 		{
-			XLOG_WARN << "connection id: " << m_connection_id
-					  << ", read client username/passwd error: " << ec.message();
-			co_return false;
+			XLOG_WARN << "get_local_address, host_name: " << ec.message();
+
+			co_return;
 		}
 
-		auto p = net::buffer_cast<const char*>(m_local_buffer.data());
-		int auth_version = read<int8_t>(p);
-		if (auth_version != 1)
+		if (!detect_hostname(hostname))
 		{
-			XLOG_WARN << "connection id: " << m_connection_id << ", socks negotiation, unsupported socks5 protocol";
-			co_return false;
+			m_local_addrs.insert(net::ip::make_address(hostname, ec));
+			co_return;
 		}
-		int name_length = read<uint8_t>(p);
-		if (name_length <= 0 || name_length > 255)
-		{
-			XLOG_WARN << "connection id: " << m_connection_id << ", socks negotiation, invalid name length";
-			co_return false;
-		}
-		name_length += 1;
 
-		//  +----+------+----------+------+----------+
-		//  |VER | ULEN |  UNAME   | PLEN |  PASSWD  |
-		//  +----+------+----------+------+----------+
-		//  | 1  |  1   | 1 to 255 |  1   | 1 to 255 |
-		//  +----+------+----------+------+----------+
-		//              [                 ]
-		m_local_buffer.consume(m_local_buffer.size());
-		bytes = co_await net::async_read(m_local_socket, m_local_buffer, net::transfer_exactly(name_length),
-										 net_awaitable[ec]);
+		tcp::resolver resolver(m_executor);
+		tcp::resolver::query query(hostname, "");
+
+		auto it = co_await resolver.async_resolve(query, net_awaitable[ec]);
 		if (ec)
 		{
-			XLOG_WARN << "connection id: " << m_connection_id << ", read client username error: " << ec.message();
-			co_return false;
+			XLOG_WARN << "get_local_address, async_resolve: " << ec.message();
+
+			co_return;
 		}
 
-		std::string uname;
-
-		p = net::buffer_cast<const char*>(m_local_buffer.data());
-		for (size_t i = 0; i < bytes - 1; i++)
+		while (it != tcp::resolver::iterator())
 		{
-			uname.push_back(read<int8_t>(p));
+			tcp::endpoint ep = *it++;
+			m_local_addrs.insert(ep.address());
 		}
+	}
 
-		int passwd_len = read<uint8_t>(p);
-		if (passwd_len <= 0 || passwd_len > 255)
+	bool proxy_server::region_filter(const std::vector<std::string>& local_info) const noexcept
+	{
+		auto& deny_region = m_option.deny_regions_;
+		auto& allow_region = m_option.allow_regions_;
+
+		std::optional<bool> allow;
+
+		if (m_ipip && (!allow_region.empty() || !deny_region.empty()))
 		{
-			XLOG_WARN << "connection id: " << m_connection_id << ", socks negotiation, invalid passwd length";
-			co_return false;
-		}
-
-		//  +----+------+----------+------+----------+
-		//  |VER | ULEN |  UNAME   | PLEN |  PASSWD  |
-		//  +----+------+----------+------+----------+
-		//  | 1  |  1   | 1 to 255 |  1   | 1 to 255 |
-		//  +----+------+----------+------+----------+
-		//                                [          ]
-		m_local_buffer.consume(m_local_buffer.size());
-		bytes = co_await net::async_read(m_local_socket, m_local_buffer, net::transfer_exactly(passwd_len),
-										 net_awaitable[ec]);
-		if (ec)
-		{
-			XLOG_WARN << "connection id: " << m_connection_id << ", read client passwd error: " << ec.message();
-			co_return false;
-		}
-
-		std::string passwd;
-
-		p = net::buffer_cast<const char*>(m_local_buffer.data());
-		for (size_t i = 0; i < bytes; i++)
-		{
-			passwd.push_back(read<int8_t>(p));
-		}
-
-		// SOCKS5验证用户和密码.
-		auto endp = m_local_socket.remote_endpoint();
-		auto client = endp.address().to_string();
-		client += ":" + std::to_string(endp.port());
-
-		// 用户认证逻辑.
-		bool verify_passed = m_option.auth_users_.empty();
-
-		for (auto [user, pwd] : m_option.auth_users_)
-		{
-			if (uname == user && passwd == pwd)
+			for (auto& region : allow_region)
 			{
-				verify_passed = true;
-				user_rate_limit_config(user);
-				break;
+				for (auto& l : local_info)
+				{
+					if (l == region)
+					{
+						allow.emplace(true);
+						break;
+					}
+					allow.emplace(false);
+				}
+
+				if (allow && *allow)
+				{
+					break;
+				}
+			}
+
+			if (!allow)
+			{
+				for (auto& region : deny_region)
+				{
+					for (auto& l : local_info)
+					{
+						if (l == region)
+						{
+							allow.emplace(false);
+							break;
+						}
+						allow.emplace(true);
+					}
+
+					if (allow && !*allow)
+					{
+						break;
+					}
+				}
 			}
 		}
 
-		XLOG_DBG << "connection id: " << m_connection_id << ", auth: " << uname << ", passwd: " << passwd
-				 << ", client: " << client;
-
-		net::streambuf wbuf;
-		auto wp = net::buffer_cast<char*>(wbuf.prepare(16));
-		write<uint8_t>(0x01, wp); // version 只能是1.
-		if (verify_passed)
+		if (!allow)
 		{
-			write<uint8_t>(0x00, wp); // 认证通过返回0x00, 其它值为失败.
-		}
-		else
-		{
-			write<uint8_t>(0x01, wp); // 认证返回0x01为失败.
+			return true;
 		}
 
-		// 返回认证状态.
-		//  +----+--------+
-		//  |VER | STATUS |
-		//  +----+--------+
-		//  | 1  |   1    |
-		//  +----+--------+
-		wbuf.commit(2);
-		co_await net::async_write(m_local_socket, wbuf, net::transfer_exactly(2), net_awaitable[ec]);
-		if (ec)
-		{
-			XLOG_WARN << "connection id: " << m_connection_id << ", server write status error: " << ec.message();
-			co_return false;
-		}
-
-		co_return verify_passed;
+		return *allow;
 	}
 
-	std::pmr::vector<std::pmr::string> proxy_session::format_path_list(
-		const std::string& path, boost::system::error_code& ec, pmr_alloc_t alloc)
-	{
-		fs::directory_iterator end;
-		fs::directory_iterator it(path, ec);
-		if (ec)
-		{
-			XLOG_DBG << "connection id: " << m_connection_id << ", format_path_list read dir: " << path
-					 << ", error: " << ec.message();
-			return {};
-		}
-
-		std::pmr::vector<std::pmr::string> path_list{alloc};
-		std::pmr::vector<std::pmr::string> file_list{alloc};
-
-		for (; it != end && !m_abort; it++)
-		{
-			const auto& item = it->path();
-
-			auto [time_string, unc_path] = file_last_wirte_time(item);
-			// std::wstring time_string = boost::nowide::widen(ftime);
-
-			std::pmr::string rpath{alloc};
-
-			if (fs::is_directory(unc_path.empty() ? item : unc_path, ec))
-			{
-				rpath = item.filename().string();
-				rpath += "/";
-
-				auto show_path = rpath;
-				if (show_path.size() > 50)
-				{
-					show_path = show_path.substr(0, 47);
-					show_path += "..&gt;";
-				}
-				std::pmr::string str(alloc);
-				fmt::format_to(std::back_inserter(str), body_fmt, rpath, show_path, time_string, "-");
-
-				path_list.push_back(std::move(str));
-			}
-			else
-			{
-				rpath = item.filename().string();
-				std::string filesize;
-				if (unc_path.empty())
-				{
-					unc_path = item;
-				}
-				auto sz = static_cast<float>(fs::file_size(unc_path, ec));
-				if (ec)
-				{
-					sz = 0;
-				}
-				filesize = strutil::add_suffix(sz);
-				auto show_path = rpath;
-				if (show_path.size() > 50)
-				{
-					show_path = show_path.substr(0, 47);
-					show_path += "..&gt;";
-				}
-				std::pmr::string str(alloc);
-				fmt::format_to(std::back_inserter(str), body_fmt, rpath, show_path, time_string, filesize);
-
-				file_list.push_back(std::move(str));
-			}
-		}
-
-		ec = {};
-
-		path_list.insert(path_list.end(), file_list.begin(), file_list.end());
-
-		return path_list;
-	}
-
-	std::pmr::string proxy_session::server_date_string(pmr_alloc_t alloc)
-	{
-		auto time = std::time(nullptr);
-		auto gmt = gmtime((const time_t*)&time);
-
-		std::pmr::string str(64, '\0', alloc);
-		auto ret = strftime((char*)str.data(), 64, "%a, %d %b %Y %H:%M:%S GMT", gmt);
-		str.resize(ret);
-
-		return str;
-	}
-
-	fs::path proxy_session::path_cat(std::string_view doc, std::string_view target)
-	{
-		size_t start_pos = 0;
-		for (auto& c : target)
-		{
-			if (!(c == '/' || c == '\\'))
-			{
-				break;
-			}
-
-			start_pos++;
-		}
-
-		std::array<std::byte, 4096> pre_alloc_buf;
-		std::pmr::monotonic_buffer_resource mbr(pre_alloc_buf.data(), pre_alloc_buf.size());
-		std::pmr::polymorphic_allocator<char> alloc(&mbr);
-
-		std::string_view sv;
-		std::pmr::string slash{"/", alloc};
-
-		if (start_pos < target.size())
-		{
-			sv = target.substr(start_pos);
-		}
-#ifdef WIN32
-		slash = "\\";
-		if (doc.back() == '/' || doc.back() == '\\')
-		{
-			slash = "";
-		}
-		auto filename = std::pmr::string(doc, alloc) + slash + std::pmr::string(sv, alloc);
-		return fs::path(std::string_view(filename));
-#else
-		if (doc.back() == '/')
-		{
-			slash = "";
-		}
-		return fs::path(std::pmr::string(doc, alloc) + slash + std::pmr::string(sv, alloc));
-#endif // WIN32
-	}
-
-	net::awaitable<void> proxy_session::default_http_route(const string_request& request, std::string response,
-														   http::status status)
-	{
-		boost::system::error_code ec;
-
-		std::array<std::byte, 4096> pre_alloc_buf;
-		std::pmr::monotonic_buffer_resource mbr(pre_alloc_buf.data(), pre_alloc_buf.size());
-		pmr_alloc_t alloc(&mbr);
-
-		string_response res{std::piecewise_construct, std::make_tuple(alloc),
-							std::make_tuple(status, request.version(), alloc)};
-
-		res.set(http::field::server, version_string);
-		res.set(http::field::date, server_date_string(alloc));
-		res.set(http::field::content_type, "text/html");
-
-		res.keep_alive(true);
-		res.body() = response;
-		res.prepare_payload();
-
-		string_response_serializer sr(res);
-		co_await http::async_write(m_local_socket, sr, net_awaitable[ec]);
-		if (ec)
-		{
-			XLOG_WARN << "connection id: " << m_connection_id << ", default http route err: " << ec.message();
-		}
-
-		co_return;
-	}
-
-	net::awaitable<void> proxy_session::location_http_route(const string_request& request, const std::string& path)
-	{
-		boost::system::error_code ec;
-
-		std::array<std::byte, 4096> pre_alloc_buf;
-		std::pmr::monotonic_buffer_resource mbr(pre_alloc_buf.data(), pre_alloc_buf.size());
-		pmr_alloc_t alloc(&mbr);
-
-		string_response res{std::piecewise_construct, std::make_tuple(alloc),
-							std::make_tuple(http::status::moved_permanently, request.version(), alloc)};
-
-		res.set(http::field::server, version_string);
-		res.set(http::field::date, server_date_string(alloc));
-		res.set(http::field::content_type, "text/html");
-		res.set(http::field::location, path);
-
-		res.keep_alive(true);
-		res.body() = fake_302_content;
-		res.prepare_payload();
-
-		string_response_serializer sr(res);
-		co_await http::async_write(m_local_socket, sr, net_awaitable[ec]);
-		if (ec)
-		{
-			XLOG_WARN << "connection id: " << m_connection_id << ", location http route err: " << ec.message();
-		}
-
-		co_return;
-	}
-
-	net::awaitable<void> proxy_session::forbidden_http_route(const string_request& request)
-	{
-		boost::system::error_code ec;
-
-		std::array<std::byte, 4096> pre_alloc_buf;
-		std::pmr::monotonic_buffer_resource mbr(pre_alloc_buf.data(), pre_alloc_buf.size());
-		pmr_alloc_t alloc(&mbr);
-
-		string_response res{std::piecewise_construct, std::make_tuple(alloc),
-							std::make_tuple(http::status::forbidden, request.version(), alloc)};
-
-		res.set(http::field::server, version_string);
-		res.set(http::field::date, server_date_string(alloc));
-		res.set(http::field::content_type, "text/html");
-
-		res.keep_alive(true);
-		res.body() = fake_403_content;
-		res.prepare_payload();
-
-		http::serializer<false, string_body, http::basic_fields<pmr_alloc_t>> sr(res);
-		co_await http::async_write(m_local_socket, sr, net_awaitable[ec]);
-		if (ec)
-		{
-			XLOG_WARN << "connection id: " << m_connection_id << ", forbidden http route err: " << ec.message();
-		}
-
-		co_return;
-	}
-
-	net::awaitable<void> proxy_session::unauthorized_http_route(const string_request& request)
-	{
-		boost::system::error_code ec;
-
-		std::array<std::byte, 4096> pre_alloc_buf;
-		std::pmr::monotonic_buffer_resource mbr(pre_alloc_buf.data(), pre_alloc_buf.size());
-		pmr_alloc_t alloc(&mbr);
-
-		string_response res{std::piecewise_construct, std::make_tuple(alloc),
-							std::make_tuple(http::status::unauthorized, request.version(), alloc)};
-
-		res.set(http::field::server, version_string);
-		res.set(http::field::date, server_date_string(alloc));
-		res.set(http::field::content_type, "text/html; charset=UTF-8");
-		res.set(http::field::www_authenticate, "Basic realm=\"proxy\"");
-
-		res.keep_alive(true);
-		res.body() = fake_401_content;
-		res.prepare_payload();
-
-		http::serializer<false, string_body, http::basic_fields<pmr_alloc_t>> sr(res);
-		co_await http::async_write(m_local_socket, sr, net_awaitable[ec]);
-		if (ec)
-		{
-			XLOG_WARN << "connection id: " << m_connection_id << ", unauthorized http route err: " << ec.message();
-		}
-
-		co_return;
-	}
 } // namespace proxy

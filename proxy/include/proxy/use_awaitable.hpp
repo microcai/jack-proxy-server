@@ -7,10 +7,7 @@
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 //
-
-#ifndef INCLUDE__2023_10_18__USE_AWAITABLE_HPP
-#define INCLUDE__2023_10_18__USE_AWAITABLE_HPP
-
+#pragma once
 
 #include <boost/type_traits.hpp>
 #include <boost/asio/io_context.hpp>
@@ -59,4 +56,3 @@ namespace asio_util
 	asio_util::asio_use_awaitable_t<
 		boost::asio::io_context::executor_type> ioc_awaitable;
 
-#endif // INCLUDE__2023_10_18__USE_AWAITABLE_HPP

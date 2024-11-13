@@ -10,7 +10,6 @@
 
 #include <vector>
 #include <string>
-#include <exception>
 
 #include <boost/filesystem.hpp>
 #include <boost/asio/ip/address.hpp>

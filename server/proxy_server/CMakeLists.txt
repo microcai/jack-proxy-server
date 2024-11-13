@@ -11,6 +11,10 @@ add_executable(proxy_server
 
 target_link_libraries(proxy_server
     ${PROXY_LIBRARIES}
+	Boost::thread
+	Boost::date_time
+	Boost::program_options
+	Boost::filesystem
 )
 
 target_compile_definitions(proxy_server PUBLIC -DVERSION_GIT=\"${PVERSION}\")

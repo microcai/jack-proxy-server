@@ -31,7 +31,11 @@ target_sources(libproxy
 
 	${CMAKE_CURRENT_SOURCE_DIR}/src/lib_asio_beast.cpp
 	${CMAKE_CURRENT_SOURCE_DIR}/src/ipip.cpp
+	${CMAKE_CURRENT_SOURCE_DIR}/src/proxy_session.cpp
 	${CMAKE_CURRENT_SOURCE_DIR}/src/proxy_server.cpp
+	${CMAKE_CURRENT_SOURCE_DIR}/src/scramble.cpp
+	${CMAKE_CURRENT_SOURCE_DIR}/src/default_cert.cpp
+	${CMAKE_CURRENT_SOURCE_DIR}/src/mimes.cpp
 )
 
 target_include_directories(libproxy
@@ -45,11 +49,8 @@ target_compile_definitions(libproxy
 )
 
 target_link_libraries(libproxy
-	Boost::thread
 	Boost::date_time
-	Boost::program_options
 	Boost::filesystem
-	Boost::signals2
 	Boost::nowide
 	Boost::url
 	Boost::json
@@ -86,3 +87,5 @@ set(PROXY_LIBRARIES
 	libproxy
 	PARENT_SCOPE
 )
+
+target_precompile_headers(libproxy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include/proxy/libproxy_pch.hpp)

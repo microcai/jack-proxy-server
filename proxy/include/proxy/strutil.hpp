@@ -13,9 +13,7 @@
  ******************************************************************************
 */
 
-#ifndef INCLUDE__2023_10_18__STRUTIL_HPP
-#define INCLUDE__2023_10_18__STRUTIL_HPP
-
+#pragma once
 
 #include <algorithm>
 #include <cctype>
@@ -229,6 +227,20 @@ namespace strutil
 		return str;
 	}
 
+	inline std::string_view remove_spaces(std::string_view str)
+	{
+		auto start_pos = 0;
+		auto end_pos = str.size();
+
+		while ( std::isspace( str[start_pos] ) )
+			start_pos ++;
+
+		while ( std::isspace( str[end_pos-1] ) )
+			end_pos --;
+
+		return str.substr(start_pos, end_pos);
+	}
+
 	inline std::string remove_spaces(std::string str)
 	{
 		str.erase(std::remove_if(
@@ -436,6 +448,33 @@ namespace strutil
 
 		tokens.push_back(str.substr(pos_start));
 		return tokens;
+	}
+
+	/**
+	 * @brief Splits input std::string str according to input std::string delim.
+	 *        Taken from: https://stackoverflow.com/a/46931770/1892346.
+	 * @param str - std::string that will be split.
+	 * @param delim - the delimiter.
+	 * @return std::vector<std::string> that contains all splitted tokens.
+	 */
+	template<typename InsertIterator>
+	inline std::size_t split(std::string_view str, std::string_view delim, InsertIterator output)
+	{
+		size_t pos_start = 0, pos_end, delim_len = delim.length();
+		std::string_view token;
+		std::size_t split_count = 0;
+
+		while ((pos_end = str.find(delim, pos_start)) != std::string::npos)
+		{
+			token = str.substr(pos_start, pos_end - pos_start);
+			pos_start = pos_end + delim_len;
+			output = token;
+			split_count ++;
+		}
+
+		output = str.substr(pos_start);
+		split_count ++;
+		return split_count;
 	}
 
 	/**
@@ -1768,5 +1807,3 @@ namespace strutil
 	}
 
 }
-
-#endif // INCLUDE__2023_10_18__STRUTIL_HPP

@@ -4,6 +4,7 @@
 // Author: jack
 // Email:  jack.wgm at gmail dot com
 //
+#include "proxy/libproxy_pch.hpp"
 
 #include <boost/algorithm/string.hpp>
 

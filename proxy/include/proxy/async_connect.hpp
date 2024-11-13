@@ -8,12 +8,10 @@
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 //
 
-#ifndef INCLUDE__2023_10_18__ASYNC_CONNECT_HPP
-#define INCLUDE__2023_10_18__ASYNC_CONNECT_HPP
+#pragma once
 
 #include <atomic>
 #include <iterator>
-#include <memory>
 #include <tuple>
 #include <type_traits>
 #include <utility>
@@ -431,4 +429,3 @@ auto async_connect(
 
 } // namespace asio_util
 
-#endif // INCLUDE__2023_10_18__ASYNC_CONNECT_HPP
