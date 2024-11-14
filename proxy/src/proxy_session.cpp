@@ -186,7 +186,7 @@ R"xx(<html>
 			return "auth unknown";
 		}
 	}
-	
+
 	//////////////////////////////////////////
 
 	// parser_http_ranges 用于解析 http range 请求头.
@@ -3382,7 +3382,7 @@ R"xx(<html>
 				co_return;
 			}
 		}
-		while (!ec);
+		while (total < content_length);
 
 		XLOG_DBG << "connection id: " << m_connection_id << ", http request: " << hctx.target_ << ", completed";
 
