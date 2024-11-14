@@ -32,6 +32,8 @@ target_sources(libproxy
 	${CMAKE_CURRENT_SOURCE_DIR}/src/lib_asio_beast.cpp
 	${CMAKE_CURRENT_SOURCE_DIR}/src/ipip.cpp
 	${CMAKE_CURRENT_SOURCE_DIR}/src/proxy_session.cpp
+	${CMAKE_CURRENT_SOURCE_DIR}/src/proxy_session_sep1.cpp
+	${CMAKE_CURRENT_SOURCE_DIR}/src/proxy_session_sep2.cpp
 	${CMAKE_CURRENT_SOURCE_DIR}/src/proxy_server.cpp
 	${CMAKE_CURRENT_SOURCE_DIR}/src/scramble.cpp
 	${CMAKE_CURRENT_SOURCE_DIR}/src/default_cert.cpp

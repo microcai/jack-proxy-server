@@ -61,8 +61,10 @@ namespace proxy
 			return static_cast<tcp::socket&>(socket.lowest_layer());
 		}
 
+		std::tuple<std::string, fs::path> file_last_wirte_time(const fs::path& file);
 		std::pmr::string path_cat(std::string_view doc, std::string_view target, pmr_alloc_t alloc);
 
+		std::pmr::string make_target_path(std::string_view target, pmr_alloc_t alloc);
 		std::pmr::string make_real_target_path(std::string_view target, pmr_alloc_t alloc);
 
 	public:
