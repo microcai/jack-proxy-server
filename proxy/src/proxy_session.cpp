@@ -3357,20 +3357,19 @@ R"xx(<html>
 
 		do
 		{
+			auto remain_to_read = std::min<std::streamsize>(buf_size, content_length - total);
 #if defined (BOOST_ASIO_HAS_FILE)
-			auto bytes_transferred = co_await file.async_read_some(net::buffer(buf, buf_size), net_awaitable[ec]);
-			if ((ec == net::error::eof) || (bytes_transferred == 0))
-			{
-				break;
-			}
+			auto bytes_transferred = co_await file.async_read_some(net::buffer(buf, remain_to_read), net_awaitable[ec]);
 #else
-			auto bytes_transferred = fileop::read(file, std::span<char>(buf, buf_size));
-			bytes_transferred = std::min<std::streamsize>(bytes_transferred, content_length - total);
+			auto bytes_transferred = fileop::read(file, std::span<char>(buf, remain_to_read));
+
+#endif
 			if (bytes_transferred == 0 || total >= (std::streamsize)content_length)
 			{
 				break;
 			}
-#endif
+
+			bytes_transferred = std::min<std::streamsize>(bytes_transferred, content_length - total);
 
 			stream_expires_after(m_local_socket, std::chrono::seconds(m_option.tcp_timeout_));
 
