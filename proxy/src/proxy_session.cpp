@@ -110,6 +110,15 @@ Connection: close
 </body>
 </html>)x*x*x";
 
+	static const char fake_404_content[] =
+R"x*x*x(<html><head><title>404 Not Found</title></head>
+<body>
+<center><h1>404 Not Found</h1></center>
+<hr>
+<center>nginx/1.20.2</center>
+</body>
+</html>)x*x*x";
+
 	static const char fake_407_content_fmt[] =
 R"x*x*x(HTTP/1.1 407 Proxy Authentication Required
 Server: nginx/1.20.2
@@ -3118,9 +3127,19 @@ R"x*x*x(<html>
 
 			std::pmr::string fake_page{hctx.alloc};
 
-			fmt::vformat_to(std::back_inserter(fake_page), fake_404_content_fmt, fmt::make_format_args(server_date_string(hctx.alloc)));
+			span_response res{
+				std::piecewise_construct,
+				std::make_tuple(boost::span<const char, boost::dynamic_extent>{fake_404_content, sizeof fake_404_content - 1}),
+				std::make_tuple(http::status::not_found, request.version(), hctx.alloc)
+			};
+			res.set(http::field::server, version_string);
+			res.set(http::field::date, server_date_string(hctx.alloc));
+			res.keep_alive(request.keep_alive());
+			res.prepare_payload();
 
-			co_await net::async_write(m_local_socket, net::buffer(fake_page), net::transfer_all(), net_awaitable[ec]);
+			span_response_serializer sr(res);
+
+			co_await http::async_write(m_local_socket, sr, net_awaitable[ec]);
 
 			co_return;
 		}
