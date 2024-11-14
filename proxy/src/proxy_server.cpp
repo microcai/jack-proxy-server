@@ -543,7 +543,7 @@ namespace proxy
 		sockaddr_storage addr;
 		socklen_t addrlen = sizeof(addr);
 
-		int protocol = addr.ss_family == AF_INET6 ? IPPROTO_IPV6 : IPPROTO_IP;
+		int protocol = socket.lowest_layer().local_endpoint().protocol() == net::ip::tcp::v6() ? IPPROTO_IPV6 : IPPROTO_IP;
 
 		if (::getsockopt(sockfd, protocol, SO_ORIGINAL_DST, (char*)&addr, &addrlen) < 0)
 		{
