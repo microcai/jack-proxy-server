@@ -140,6 +140,15 @@ R"x*x*x(<html>
 </html>
 )x*x*x";
 
+	static const char fake_502_content[] =
+R"xx(<html>
+<head><title>502 Bad Gateway</title></head>
+<body>
+<center><h1>502 Bad Gateway</h1></center>
+<hr><center>nginx/1.26.2</center>
+</body>
+</html>)xx";
+
 	static constexpr auto head_fmt =
 		R"(<html><head><meta charset="UTF-8"><title>Index of {}</title></head><body bgcolor="white"><h1>Index of {}</h1><hr><div><table><tbody>)";
 	static constexpr auto tail_fmt =
@@ -3177,8 +3186,8 @@ R"x*x*x(<html>
 #if defined (BOOST_ASIO_HAS_FILE)
 #	if defined(_WIN32)
 		net::stream_file file(co_await net::this_coro::executor);
-		file.assign(::CreateFileW(path.wstring().c_str(), GENERIC_READ, 0, 0,
-          	OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, 0), ec);
+		file.assign(::CreateFileW(path.wstring().c_str(), GENERIC_READ, FILE_SHARE_READ, 0,
+          	OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED|FILE_FLAG_SEQUENTIAL_SCAN, 0), ec);
 #	else
 		net::stream_file file(co_await net::this_coro::executor, path.string(), net::stream_file::read_only);
 #	endif
@@ -3254,6 +3263,36 @@ R"x*x*x(<html>
 #else
 			file.seekg(r.first, std::ios_base::beg);
 #endif
+		}
+
+		if (ec)
+		{
+			XLOG_WARN << "connection id: " << m_connection_id << ", open target: " << path << " failed: " << ec.message();
+			// FILE OPEN FAILED
+			// 返回 502
+			st = http::status::internal_server_error;
+
+			span_response res{
+				std::piecewise_construct,
+				std::make_tuple(boost::span<const char, boost::dynamic_extent>{fake_502_content, sizeof (fake_502_content) - 1}),
+				std::make_tuple(http::status::found, request.version(), hctx.alloc)
+			};
+
+			res.set(http::field::server, version_string);
+			res.set(http::field::date, server_date_string(hctx.alloc));
+			res.set(http::field::content_type, "text/html; charset=UTF-8");
+
+			res.keep_alive(true);
+			res.prepare_payload();
+
+			span_response_serializer sr(res);
+			co_await http::async_write(m_local_socket, sr, net_awaitable[ec]);
+			if (ec)
+			{
+				XLOG_WARN << "connection id: " << m_connection_id << ", send 502 err: " << ec.message();
+			}
+
+			co_return;
 		}
 
 		custom_body_response res{
