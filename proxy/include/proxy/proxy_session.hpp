@@ -54,16 +54,6 @@ namespace proxy
 			std::pmr::string target_path_;
 		};
 
-		enum {
-			PROXY_AUTH_SUCCESS = 0,
-			PROXY_AUTH_FAILED,
-			PROXY_AUTH_NONE,
-			PROXY_AUTH_ILLEGAL,
-		};
-
-		// http 认证错误代码对应的错误信息.
-		std::string pauth_error_message(int code) const noexcept;
-
 		// net_tcp_socket 用于将 stream 转换为 tcp::socket 对象.
 		template <typename Stream>
 		tcp::socket& net_tcp_socket(Stream& socket)
@@ -81,6 +71,12 @@ namespace proxy
 
 		~proxy_session();
 
+		enum {
+			PROXY_AUTH_SUCCESS = 0,
+			PROXY_AUTH_FAILED,
+			PROXY_AUTH_NONE,
+			PROXY_AUTH_ILLEGAL,
+		};
 	public:
 		virtual void start() override;
 

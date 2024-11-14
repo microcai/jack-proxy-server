@@ -151,6 +151,24 @@ R"x*x*x(<html>
 		return false;
 	}
 
+	// http 认证错误代码对应的错误信息.
+	static std::string pauth_error_message(int code) noexcept
+	{
+		switch (code)
+		{
+		case proxy_session::PROXY_AUTH_SUCCESS:
+			return "auth success";
+		case proxy_session::PROXY_AUTH_FAILED:
+			return "auth failed";
+		case proxy_session::PROXY_AUTH_NONE:
+			return "auth none";
+		case proxy_session::PROXY_AUTH_ILLEGAL:
+			return "auth illegal";
+		default:
+			return "auth unknown";
+		}
+	}
+	
 	//////////////////////////////////////////
 
 	// parser_http_ranges 用于解析 http range 请求头.
@@ -309,7 +327,7 @@ R"x*x*x(<html>
 #ifdef WIN32
 			if (file.string().size() > MAX_PATH)
 			{
-				unc_path_ = make_unc_path(file.string());
+				unc_path = make_unc_path(file.string());
 				ftime = fs::last_write_time(unc_path, ec);
 			}
 #endif
@@ -351,23 +369,6 @@ R"x*x*x(<html>
 	}
 
 	////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-	std::string proxy_session::pauth_error_message(int code) const noexcept
-	{
-		switch (code)
-		{
-		case PROXY_AUTH_SUCCESS:
-			return "auth success";
-		case PROXY_AUTH_FAILED:
-			return "auth failed";
-		case PROXY_AUTH_NONE:
-			return "auth none";
-		case PROXY_AUTH_ILLEGAL:
-			return "auth illegal";
-		default:
-			return "auth unknown";
-		}
-	}
-
 	std::pmr::string proxy_session::path_cat(std::string_view doc, std::string_view target, pmr_alloc_t alloc)
 	{
 		size_t start_pos = 0;
@@ -3008,8 +3009,8 @@ R"x*x*x(<html>
 
 		// 查找目录下是否存在 index.html 或 index.htm 文件, 如果存在则返回该文件.
 		// 否则返回目录下的文件列表.
-		auto index_html = fs::path(hctx.target_path_) / "index.html";
-		fs::exists(index_html, ec) ? index_html = index_html : index_html = fs::path(hctx.target_path_) / "index.htm";
+		auto index_html = fs::path(std::string_view{hctx.target_path_}) / "index.html";
+		fs::exists(index_html, ec) ? index_html = index_html : index_html = fs::path(std::string_view{hctx.target_path_}) / "index.htm";
 
 		if (fs::exists(index_html, ec))
 		{
