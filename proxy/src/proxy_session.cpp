@@ -3174,26 +3174,35 @@ R"x*x*x(<html>
 
 			co_return;
 		}
-
+#if defined (BOOST_ASIO_HAS_FILE)
+#	if defined(_WIN32)
+		net::stream_file file(co_await net::this_coro::executor);
+		file.assign(::CreateFileW(path.wstring().c_str(), GENERIC_READ, 0, 0,
+          	OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, 0), ec);
+#	else
+		net::stream_file file(co_await net::this_coro::executor, path.string(), net::stream_file::read_only);
+#	endif
+#else // BOOST_ASIO_HAS_FILE
 		boost::nowide::fstream file(path.string(), std::ios_base::binary | std::ios_base::in);
+#endif //BOOST_ASIO_HAS_FILE
 
-		std::string user_agent;
+		std::pmr::string user_agent { hctx.alloc };
 		if (request.count(http::field::user_agent))
 		{
-			user_agent = std::string(request[http::field::user_agent]);
+			user_agent = request[http::field::user_agent];
 		}
 
-		std::string referer;
+		std::pmr::string referer { hctx.alloc };
 		if (request.count(http::field::referer))
 		{
-			referer = std::string(request[http::field::referer]);
+			referer = request[http::field::referer];
 		}
 
 		XLOG_DBG << "connection id: " << m_connection_id << ", http file: " << hctx.target_
 				 << ", size: " << content_length
-				 << (request.count("Range") ? ", range: " + std::string(request["Range"]) : std::string())
-				 << (!user_agent.empty() ? ", user_agent: " + user_agent : std::string())
-				 << (!referer.empty() ? ", referer: " + referer : std::string());
+				 << (request.count("Range") ? ", range: " + std::pmr::string(request["Range"], hctx.alloc) : std::pmr::string(hctx.alloc))
+				 << (!user_agent.empty() ? ", user_agent: " + user_agent : std::pmr::string(hctx.alloc))
+				 << (!referer.empty() ? ", referer: " + referer : std::pmr::string(hctx.alloc));
 
 		http::status st = http::status::ok;
 		auto range = parser_http_ranges(request["Range"]);
@@ -3240,8 +3249,11 @@ R"x*x*x(<html>
 					r.second = content_length - 1;
 				}
 			}
-
+#if defined (BOOST_ASIO_HAS_FILE)
+			file.seek(r.first, net::stream_file::seek_set);
+#else
 			file.seekg(r.first, std::ios_base::beg);
+#endif
 		}
 
 		custom_body_response res{
@@ -3306,12 +3318,20 @@ R"x*x*x(<html>
 
 		do
 		{
+#if defined (BOOST_ASIO_HAS_FILE)
+			auto bytes_transferred = co_await file.async_read_some(net::buffer(buf, buf_size), net_awaitable[ec]);
+			if ((ec == net::error::eof) || (bytes_transferred == 0))
+			{
+				break;
+			}
+#else
 			auto bytes_transferred = fileop::read(file, std::span<char>(buf, buf_size));
 			bytes_transferred = std::min<std::streamsize>(bytes_transferred, content_length - total);
 			if (bytes_transferred == 0 || total >= (std::streamsize)content_length)
 			{
 				break;
 			}
+#endif
 
 			stream_expires_after(m_local_socket, std::chrono::seconds(m_option.tcp_timeout_));
 
