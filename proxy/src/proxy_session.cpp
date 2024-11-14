@@ -3335,7 +3335,7 @@ R"x*x*x(<html>
 		{
 			XLOG_DBG << "connection id: " << m_connection_id << ", format_path_list read dir: " << path
 					 << ", error: " << ec.message();
-			return {};
+			return std::pmr::vector<std::pmr::string>{alloc};
 		}
 
 		std::pmr::vector<std::pmr::string> path_list{alloc};
