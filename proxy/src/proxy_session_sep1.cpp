@@ -710,6 +710,30 @@ R"xx(<html>
 				else
 				{
 					r.second = content_length - 1;
+
+					if (r.first == content_length)
+					{
+						std::pmr::string content_range{hctx.alloc};
+						fmt::format_to(std::back_inserter(content_range), "bytes */{}", r.second, r.second, content_length);
+						
+						span_response res{
+							std::piecewise_construct,
+							std::make_tuple(boost::span<const char, boost::dynamic_extent>{fake_416_content, sizeof (fake_416_content) - 1}),
+							std::make_tuple(http::status::range_not_satisfiable, request.version(), hctx.alloc)
+						};
+
+						res.set(http::field::server, version_string);
+						res.set(http::field::date, server_date_string(hctx.alloc));
+						res.set(http::field::content_type, "text/html; charset=UTF-8");
+						res.set(http::field::content_range, content_range);
+
+						res.keep_alive(hctx.request_.keep_alive());
+						res.prepare_payload();
+
+						span_response_serializer sr(res);
+						co_await http::async_write(m_local_socket, sr, net_awaitable[ec]);
+						co_return;
+					}
 				}
 			}
 #if defined (BOOST_ASIO_HAS_FILE)
