@@ -821,7 +821,7 @@ R"xx(<html>
 			co_return;
 		}
 
-		auto buf_size = 5 * 1024 * 1024;
+		auto buf_size = 64 * 1024;
 		if (m_option.tcp_rate_limit_ > 0 && m_option.tcp_rate_limit_ < buf_size)
 		{
 			buf_size = m_option.tcp_rate_limit_;
