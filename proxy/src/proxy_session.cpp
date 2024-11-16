@@ -12,6 +12,7 @@
 #include "proxy/scramble.hpp"
 #include "proxy/use_awaitable.hpp"
 #include "proxy/proxy_stream.hpp"
+#include "proxy/splice.hpp"
 
 #include <boost/asio.hpp>
 #include <boost/asio/experimental/awaitable_operators.hpp>
@@ -282,41 +283,13 @@ Content-Length: 0
 	template<typename S1, typename S2>
 	net::awaitable<void> proxy_session::transfer(S1& from, S2& to, size_t& bytes_transferred)
 	{
-		std::array<char, 1024 * 1024> data;
 		boost::system::error_code ec;
 		bytes_transferred = 0;
 
 		stream_rate_limit(from, m_option.tcp_rate_limit_);
 		stream_rate_limit(to, m_option.tcp_rate_limit_);
 
-		for (; !m_abort;)
-		{
-			stream_expires_after(from, std::chrono::seconds(m_option.tcp_timeout_));
-
-			auto bytes = co_await from.async_read_some(
-				net::buffer(data), net_awaitable[ec]);
-			if (ec || m_abort)
-			{
-				if (bytes > 0)
-					co_await net::async_write(to,
-						net::buffer(data, bytes), net_awaitable[ec]);
-
-				to.shutdown(net::socket_base::shutdown_send, ec);
-				co_return;
-			}
-
-			stream_expires_after(to, std::chrono::seconds(m_option.tcp_timeout_));
-
-			co_await net::async_write(to,
-				net::buffer(data, bytes), net_awaitable[ec]);
-			if (ec || m_abort)
-			{
-				from.shutdown(net::socket_base::shutdown_receive, ec);
-				co_return;
-			}
-
-			bytes_transferred += bytes;
-		}
+		bytes_transferred = co_await async_splice(from, to, -1, std::chrono::seconds(m_option.tcp_timeout_), net_awaitable[ec]);
 	}
 
 	net::awaitable<void> proxy_session::transparent_proxy()

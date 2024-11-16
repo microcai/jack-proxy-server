@@ -8,6 +8,7 @@
 #include "proxy/strutil.hpp"
 #include "proxy/logging.hpp"
 #include "proxy/use_awaitable.hpp"
+#include "proxy/splice.hpp"
 
 #include <array>
 #include <boost/asio.hpp>
@@ -350,7 +351,7 @@ R"xx(<html>
 				route_op<R"regex(^(?!.*\/$).*$)regex", &proxy_session::on_http_get>{}
 			>(this, target_pv, http_ctx, alloc);
 
-			if (!keep_alive)
+			if (!keep_alive || !req.keep_alive())
 			{
 				break;
 			}
@@ -751,7 +752,7 @@ R"xx(<html>
 					{
 						std::pmr::string content_range{hctx.alloc};
 						fmt::format_to(std::back_inserter(content_range), "bytes */{}", r.second, r.second, content_length);
-						
+
 						span_response res{
 							std::piecewise_construct,
 							std::make_tuple(boost::span<const char, boost::dynamic_extent>{fake_416_content, sizeof (fake_416_content) - 1}),
@@ -861,21 +862,18 @@ R"xx(<html>
 			buf_size = m_option.tcp_rate_limit_;
 		}
 
+		std::streamsize total = 0;
+		stream_rate_limit(m_local_socket, m_option.tcp_rate_limit_);
+#if defined (BOOST_ASIO_HAS_FILE)
+		total = co_await async_splice(file, m_local_socket, content_length, std::chrono::seconds(m_option.tcp_timeout_), net_awaitable[ec]);
+#else
 		std::unique_ptr<char, decltype(&std::free)> bufs((char*)std::malloc(buf_size), &std::free);
 		char* buf = bufs.get();
-		std::streamsize total = 0;
-
-		stream_rate_limit(m_local_socket, m_option.tcp_rate_limit_);
 
 		do
 		{
 			auto remain_to_read = std::min<std::streamsize>(buf_size, content_length - total);
-#if defined (BOOST_ASIO_HAS_FILE)
-			auto bytes_transferred = co_await file.async_read_some(net::buffer(buf, remain_to_read), net_awaitable[ec]);
-#else
 			auto bytes_transferred = fileop::read(file, std::span<char>(buf, remain_to_read));
-
-#endif
 			if (bytes_transferred == 0 || total >= (std::streamsize)content_length)
 			{
 				break;
@@ -895,8 +893,16 @@ R"xx(<html>
 			}
 		}
 		while (total < content_length);
+#endif
+		if (ec)
+		{
+			m_local_socket.close(ec);
 
-		XLOG_DBG << "connection id: " << m_connection_id << ", http request: " << hctx.target_ << ", completed";
+			XLOG_WARN << "connection id: " << m_connection_id << ", http async_write: " << ec.message()
+				<< ", already write: " << total;
+		}
+
+		XLOG_DBG << "connection id: " << m_connection_id << ", http request: " << hctx.target_ << ", completed, size: " << total;
 
 		co_return;
 	}

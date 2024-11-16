@@ -26,6 +26,12 @@ namespace util {
 
 	using tcp = net::ip::tcp;               // from <boost/asio/ip/tcp.hpp>
 
+	template<typename T>
+	concept has_expires_after = requires(T t, net::steady_timer::duration d)
+	{
+		t.expires_after(d);
+	};
+
 	//////////////////////////////////////////////////////////////////////////
 
 	template<typename... T>
@@ -112,6 +118,25 @@ namespace util {
 					t.lowest_layer().close(ec);
 				}, *this);
 		}
+
+		void expires_after(net::steady_timer::duration expiry_time)
+		{
+			if (expiry_time.count() < 0)
+			{
+				return;
+			}
+
+			boost::variant2::visit([expiry_time](auto& s) mutable
+			{
+				using ValueType = std::decay_t<decltype(s)>;
+				auto& next_layer = s.next_layer();
+				if constexpr (has_expires_after<std::decay_t<decltype(next_layer)>>)
+				{
+					next_layer.expires_after(expiry_time);
+				}
+			}, *this);
+		}
+
 	};
 }
 
