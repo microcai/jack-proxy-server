@@ -241,10 +241,15 @@ namespace proxy
 			X509 *x509_cert = SSL_CTX_get0_certificate(ssl_ctx.native_handle());
 
 			const auto expire_date = X509_get_notAfter(x509_cert);
+#if defined (OPENSSL_IS_BORINGSSL)
+			std::time_t expire_date_tm;
+			ASN1_TIME_to_time_t(expire_date, &expire_date_tm);
+			file.expire_date = boost::posix_time::from_time_t(expire_date_tm);
+#else
 			tm expire_date_tm;
 			ASN1_TIME_to_tm(expire_date, &expire_date_tm);
 			file.expire_date = boost::posix_time::ptime_from_tm(expire_date_tm);
-
+#endif
 			std::unique_ptr<GENERAL_NAMES, decltype(&GENERAL_NAMES_free)> general_names{
 				static_cast<GENERAL_NAMES*>(X509_get_ext_d2i(x509_cert, NID_subject_alt_name, 0, 0)),
 				&GENERAL_NAMES_free
