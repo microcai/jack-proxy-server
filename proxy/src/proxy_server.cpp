@@ -238,6 +238,36 @@ namespace proxy
 				}
 			}
 
+			X509 *x509_cert = SSL_CTX_get0_certificate(ssl_ctx.native_handle());
+
+			const auto expire_date = X509_get_notAfter(x509_cert);
+			tm expire_date_tm;
+			ASN1_TIME_to_tm(expire_date, &expire_date_tm);
+			file.expire_date = boost::posix_time::ptime_from_tm(expire_date_tm);
+
+			std::unique_ptr<GENERAL_NAMES, decltype(&GENERAL_NAMES_free)> general_names{
+				static_cast<GENERAL_NAMES*>(X509_get_ext_d2i(x509_cert, NID_subject_alt_name, 0, 0)),
+				&GENERAL_NAMES_free
+			};
+
+			for (int i = 0; i < sk_GENERAL_NAME_num(general_names.get()); ++i)
+			{
+				GENERAL_NAME* gen = sk_GENERAL_NAME_value(general_names.get(), i);
+				if (gen->type == GEN_DNS)
+				{
+					const  ASN1_IA5STRING* domain = gen->d.dNSName;
+
+					if (domain->type == V_ASN1_IA5STRING && domain->data && domain->length)
+					{
+						file.alt_names.emplace_back(reinterpret_cast<const char*>(domain->data), domain->length);
+					}
+				}
+			}
+
+			char cert_cname[256] = { 0 };
+			X509_NAME_get_text_by_NID(X509_get_subject_name(x509_cert), NID_commonName, cert_cname, sizeof cert_cname);
+			file.domain_ = cert_cname;
+
 			// 保存到 m_certificates 中.
 			m_certificates.emplace_back(std::move(file));
 		}

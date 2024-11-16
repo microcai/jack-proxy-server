@@ -93,6 +93,8 @@ namespace proxy {
 		pem_file dhparam_;
 
 		std::string domain_;
+		std::vector<std::string> alt_names;
+		boost::posix_time::ptime expire_date;
 
 		std::optional<net::ssl::context> ssl_context_;
 	};
