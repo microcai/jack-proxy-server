@@ -367,6 +367,41 @@ namespace proxy
 		SSL_CTX_set_tlsext_servername_arg(m_ssl_srv_context.native_handle(), this);
 	}
 
+	bool rfc2818_verification_match_pattern(const char* pattern, std::size_t pattern_length, const char* host)
+	{
+		using namespace std; // For tolower.
+
+		const char* p = pattern;
+		const char* p_end = p + pattern_length;
+		const char* h = host;
+
+		while (p != p_end && *h)
+		{
+			if (*p == '*')
+			{
+				++p;
+				while (*h && *h != '.')
+				{
+					if (rfc2818_verification_match_pattern(p, p_end - p, h++))
+					{
+						return true;
+					}
+				}
+			}
+			else if (tolower(*p) == tolower(*h))
+			{
+				++p;
+				++h;
+			}
+			else
+			{
+				return false;
+			}
+		}
+
+		return p == p_end && !*h;
+	}
+
 	int proxy_server::sni_callback(SSL* ssl, int* ad) noexcept
 	{
 		const char* servername = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
@@ -376,11 +411,24 @@ namespace proxy
 
 			for (auto& ctx : m_certificates)
 			{
-				if (ctx.domain_ == servername && ctx.ssl_context_.has_value())
+				if (ctx.ssl_context_.has_value())
 				{
-					SSL_set_SSL_CTX(ssl, ctx.ssl_context_->native_handle());
-					return SSL_TLSEXT_ERR_OK;
+					if (rfc2818_verification_match_pattern(ctx.domain_.c_str(), ctx.domain_.length(), servername))
+					{
+						SSL_set_SSL_CTX(ssl, ctx.ssl_context_->native_handle());
+						return SSL_TLSEXT_ERR_OK;
+					}
+
+					for (auto& alt_name : ctx.alt_names)
+					{
+						if (rfc2818_verification_match_pattern(alt_name.c_str(), alt_name.length(), servername))
+						{
+							SSL_set_SSL_CTX(ssl, ctx.ssl_context_->native_handle());
+							return SSL_TLSEXT_ERR_OK;
+						}
+					}
 				}
+
 				if (ctx.domain_.empty())
 				{
 					default_ctx = &ctx;
