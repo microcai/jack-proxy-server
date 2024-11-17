@@ -1,12 +1,15 @@
 
 
+#include "boost/asio/file_base.hpp"
 #include "proxy/libproxy_pch.hpp"
 
+#include "proxy/proxy_fwd.hpp"
 #include "proxy/proxy_session.hpp"
 #include "proxy/strutil.hpp"
 #include "proxy/logging.hpp"
 #include "proxy/use_awaitable.hpp"
 
+#include <array>
 #include <boost/asio.hpp>
 #include <boost/asio/experimental/awaitable_operators.hpp>
 #include <boost/hana.hpp>
@@ -18,6 +21,7 @@
 
 #include <fmt/xchar.h>
 #include <fmt/format.h>
+#include <string_view>
 
 #include "ctre.hpp"
 
@@ -669,6 +673,38 @@ R"xx(<html>
 
 		http::status st = http::status::ok;
 		auto range = parser_http_ranges(request["Range"]);
+		std::string_view content_type;
+		std::array<char, 512> file_head_content;
+		bool check_file_header_to_get_mime_type = false;
+
+		try
+		{
+			auto ext = strutil::to_lower(fs::path(path).extension().string());
+			content_type = mime_type_for_file_ext(ext);
+		}
+		catch (proxy::unknow_mime_ext)
+		{
+			check_file_header_to_get_mime_type = true;
+		}
+		if (check_file_header_to_get_mime_type)
+		{
+#if defined (BOOST_ASIO_HAS_FILE)
+			auto file_head_content_read_size = co_await file.async_read_some(net::buffer(file_head_content), net_awaitable[ec]);
+			file.seek(0, boost::asio::file_base::seek_set);
+#else
+			auto file_head_content_read_size = fileop::read(file, std::span<char>(file_head_content.data(), file_head_content.size()));
+			file.seekg(0, std::ios_base::beg);
+#endif
+			// check mime for unknow ext
+			if ( xlogger::logger_aux__::utf8_check_is_valid(std::string_view{file_head_content.data(), file_head_content_read_size}) )
+			{
+				content_type = std::string_view{"text/plain; charset=utf-8"};
+			}
+			else
+			{
+				content_type = std::string_view{"application/octet-stream"};
+			}
+		}
 
 		// 只支持一个 range 的请求, 不支持多个 range 的请求.
 		if (range.size() == 1)
@@ -782,9 +818,7 @@ R"xx(<html>
 		res.set(http::field::server, version_string);
 		res.set(http::field::date, server_date_string(hctx.alloc));
 
-		auto ext = strutil::to_lower(fs::path(path).extension().string());
-
-		res.set(http::field::content_type, mime_type_for_file_ext(ext));
+		res.set(http::field::content_type, content_type);
 
 		if (st == http::status::ok)
 		{

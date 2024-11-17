@@ -64,5 +64,5 @@ std::string_view proxy::mime_type_for_file_ext(std::string_view ext)
         return global_mimes.at(ext);
     }
 
-    return "application/octet-stream";
+    throw  proxy::unknow_mime_ext{"application/octet-stream"};
 }

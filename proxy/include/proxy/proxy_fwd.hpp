@@ -4,6 +4,7 @@
 #include "boost/beast/http/empty_body.hpp"
 #include <memory_resource>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -260,7 +261,7 @@ namespace proxy
 		// 最大设置为 64k, 最小设置为 16, 默认为 4096.
 		uint16_t noise_length_{ nosie_injection_max_len };
 	};
-
+	struct unknow_mime_ext : public std::runtime_error { using std::runtime_error::runtime_error; };
 	std::string_view mime_type_for_file_ext(std::string_view ext);
 }
 
