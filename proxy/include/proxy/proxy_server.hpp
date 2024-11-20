@@ -1,4 +1,4 @@
-﻿//
+//
 // proxy_server.hpp
 // ~~~~~~~~~~~~~~~~
 //
@@ -64,7 +64,8 @@
 # pragma warning(pop)
 #endif
 
-#include <boost/url.hpp>
+#include <boost/url/urls.hpp>
+#include <boost/url/parse.hpp>
 #include <boost/regex.hpp>
 
 #include <boost/nowide/convert.hpp>
