@@ -1,6 +1,7 @@
 
 
 #include "proxy/proxy_server.hpp"
+#include "proxy/default_cert.hpp"
 
 #include <boost/asio.hpp>
 #include <boost/hana.hpp>

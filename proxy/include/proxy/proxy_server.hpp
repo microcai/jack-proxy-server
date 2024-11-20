@@ -1,4 +1,4 @@
-//
+﻿//
 // proxy_server.hpp
 // ~~~~~~~~~~~~~~~~
 //
@@ -96,7 +96,6 @@
 #include "proxy/async_connect.hpp"
 #include "proxy/logging.hpp"
 #include "proxy/variant_stream.hpp"
-#include "proxy/default_cert.hpp"
 #include "proxy/fileop.hpp"
 #include "proxy/strutil.hpp"
 #include "proxy/ipip.hpp"
