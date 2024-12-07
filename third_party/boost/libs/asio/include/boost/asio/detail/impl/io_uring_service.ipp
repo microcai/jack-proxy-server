@@ -535,7 +535,14 @@ void io_uring_service::interrupt()
 
 void io_uring_service::init_ring()
 {
-  int result = ::io_uring_queue_init(ring_size, &ring_, 0);
+  io_uring_params params = {0};
+  params.flags = IORING_SETUP_CQSIZE|IORING_SETUP_SUBMIT_ALL|IORING_SETUP_TASKRUN_FLAG|IORING_SETUP_COOP_TASKRUN;
+
+  params.cq_entries = 65536;
+  params.sq_entries = 128;
+  params.features = IORING_FEAT_NODROP | IORING_FEAT_EXT_ARG | IORING_FEAT_FAST_POLL | IORING_FEAT_RW_CUR_POS |IORING_FEAT_CUR_PERSONALITY;
+  auto result = io_uring_queue_init_params(128, &ring_, &params);
+
   if (result < 0)
   {
     ring_.ring_fd = -1;
