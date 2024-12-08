@@ -101,6 +101,8 @@ public:
       const native_handle_type& native_descriptor,
       boost::system::error_code& ec);
 
+  BOOST_ASIO_DECL void fadvice(implementation_type& impl, off_t __offset, off_t __len, int __advise);
+
   // Determine whether the descriptor is open.
   bool is_open(const implementation_type& impl) const
   {

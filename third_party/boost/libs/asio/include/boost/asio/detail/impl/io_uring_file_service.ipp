@@ -69,8 +69,11 @@ boost::system::error_code io_uring_file_service::open(
     descriptor_ops::close(fd, state, ignored_ec);
   }
 
-  (void)::posix_fadvise(native_handle(impl), 0, 0,
+  descriptor_service_.fadvice(impl, 0, 0,
       impl.is_stream_ ? POSIX_FADV_SEQUENTIAL : POSIX_FADV_RANDOM);
+
+  // (void)::posix_fadvise(native_handle(impl), 0, 0,
+  //     impl.is_stream_ ? POSIX_FADV_SEQUENTIAL : POSIX_FADV_RANDOM);
 
   BOOST_ASIO_ERROR_LOCATION(ec);
   return ec;

@@ -114,6 +114,51 @@ boost::system::error_code io_uring_descriptor_service::assign(
   return ec;
 }
 
+void io_uring_descriptor_service::fadvice(implementation_type& impl, off_t __offset, off_t __len, int __advise)
+{
+  class fadvice_op : public io_uring_operation
+  {
+  public:
+    fadvice_op(const boost::system::error_code& success_ec, int fd, off_t __offset, off_t __len, int __advise)
+      : io_uring_operation(success_ec, &do_prepare, &do_perform, &do_complete)
+      , fd(fd)
+      , __offset(__offset)
+      , __len(__len)
+      , __advise(__advise)
+    {
+    }
+
+    static void do_prepare(io_uring_operation* base, ::io_uring_sqe* sqe)
+    {
+      fadvice_op * op = reinterpret_cast<fadvice_op*>(base);
+      ::io_uring_prep_fadvise64(sqe, op->fd, op->__offset, op->__len, op->__advise);
+    }
+
+    static bool do_perform(io_uring_operation*, bool after_completion)
+    {
+      return after_completion;
+    }
+
+    static void do_complete(void* owner, operation* base,
+        const boost::system::error_code& /*ec*/,
+        std::size_t /*bytes_transferred*/)
+    {
+      fadvice_op * op = reinterpret_cast<fadvice_op*>(base);
+      delete op;
+    }
+
+  private:
+    int fd;
+    off_t __offset;
+    off_t __len;
+    int __advise;
+  };
+
+  auto op = new fadvice_op(success_ec_, native_handle(impl), __offset, __len, __advise);
+
+  io_uring_service_.start_op(0, impl.io_object_data_, op, false);
+}
+
 boost::system::error_code io_uring_descriptor_service::close(
     io_uring_descriptor_service::implementation_type& impl,
     boost::system::error_code& ec)
